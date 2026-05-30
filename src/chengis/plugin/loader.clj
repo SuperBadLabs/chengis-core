@@ -5,6 +5,7 @@
             [chengis.plugin.manifest :as manifest]
             [chengis.plugin.registry :as registry]
             [chengis.plugin.sci :as plugin-sci]
+            [chengis.plugin.signing :as signing]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [taoensso.timbre :as log]))
@@ -58,17 +59,6 @@
       (log/warn "Failed to load plugin" ns-sym ":" (.getMessage e))
       false)))
 
-(defn- policy-trust-level
-  "The authoritative trust ceiling for an external plugin, from policy.
-   A policy with trust-level \"trusted\" (set by an admin; M2 will tie this to
-   signing/provenance) permits the fast :trusted lane. Everything else —
-   including the no-DB backward-compat path — caps at the hardened :sandboxed
-   lane. The plugin's manifest can only lower this further (see manifest/
-   effective-trust), never raise it."
-  [ds plugin-name org-id]
-  (let [policy (when ds (plugin-policy-store/get-plugin-policy ds plugin-name :org-id org-id))]
-    (if (= "trusted" (:trust-level policy)) :trusted :sandboxed)))
-
 (defn- load-external-plugins!
   "Load external plugins from the plugins directory through the SCI runtime.
 
@@ -86,7 +76,7 @@
    Capabilities and any self-imposed trust restriction come from an optional
    `<plugin>.edn` manifest (see `chengis.plugin.manifest`). The manifest can
    only narrow privilege, never widen it."
-  [plugins-dir & {:keys [ds org-id secret-config]}]
+  [plugins-dir & {:keys [ds org-id secret-config signing-keys require-signed?]}]
   (let [^java.io.File dir (io/file plugins-dir)]
     (when (.isDirectory dir)
       (let [plugin-files (->> (or (.listFiles dir) (make-array java.io.File 0))
@@ -101,27 +91,84 @@
             (log/warn "Loading" (count plugin-files) "external plugin(s) from" plugins-dir
                       "via SCI — no DB, so all run sandboxed.")))
         (doseq [^java.io.File f plugin-files]
-          (let [plugin-name (str/replace (.getName f) #"\.clj$" "")]
-            (if (and ds (not (plugin-policy-store/plugin-allowed? ds plugin-name :org-id org-id)))
-              (log/warn "Blocked untrusted external plugin:" plugin-name
-                        "— add to allowlist via Admin > Plugin Policies")
-              (let [mf           (manifest/read-manifest f)
-                    policy-trust (policy-trust-level ds plugin-name org-id)
-                    trust        (manifest/effective-trust policy-trust (:requests-trust mf))
-                    caps         (:capabilities mf)]
-                (doseq [w (:warnings mf)]
-                  (log/warn "Plugin manifest" (str plugin-name ":") w))
-                (try
-                  (plugin-sci/eval-plugin-file
-                   (.getAbsolutePath f)
-                   {:plugin-name plugin-name :trust trust :capabilities caps
-                    :ds ds :org-id org-id :secret-config secret-config})
-                  (log/info "Loaded external plugin:" (.getName f)
-                            (str "[" (name trust)
-                                 (when (seq caps) (str " caps=" (vec caps))) "]"))
-                  (catch Exception e
-                    (log/warn "Failed to load external plugin"
-                              (.getName f) ":" (.getMessage e))))))))))))
+          ;; Per-plugin try wraps EVERYTHING (incl. the source/manifest reads), so
+          ;; one unreadable/removed file is logged and skipped without aborting the
+          ;; rest of the directory.
+          (try
+            (let [plugin-name (str/replace (.getName f) #"\.clj$" "")
+                  policy      (when ds (plugin-policy-store/get-plugin-policy ds plugin-name :org-id org-id))]
+              (cond
+                ;; --- Policy gates first: decided from the policy row alone, BEFORE
+                ;;     any file I/O, so blocked plugins never get read/verified. ---
+
+                ;; Quarantine — hard block, regardless of allowlist/trust (M2b).
+                (and policy (= 1 (:quarantined policy)))
+                (log/warn "Blocked quarantined external plugin:" plugin-name
+                          "—" (or (:quarantine-reason policy) "quarantined"))
+
+                ;; Allowlist — an explicit allowed=true policy is required (with a DB).
+                (and ds (not (= 1 (:allowed policy))))
+                (log/warn "Blocked untrusted external plugin:" plugin-name
+                          "— add to allowlist via Admin > Plugin Policies")
+
+                :else
+                ;; Cleared policy — now read source + manifest ONCE and verify +
+                ;; evaluate exactly these bytes (no re-read between check and use,
+                ;; TOCTOU-safe). The signature covers BOTH source and manifest, so
+                ;; tampering either invalidates it.
+                (let [source   (slurp f)
+                      edn-file (manifest/manifest-file f)
+                      edn-str  (when (.isFile edn-file) (slurp edn-file))
+                      sig      (signing/read-signature f)
+                      signed?  (boolean
+                                (and sig
+                                     (signing/verify-payload? (.getBytes source "UTF-8")
+                                                              (when edn-str (.getBytes edn-str "UTF-8"))
+                                                              sig signing-keys)))]
+                  (cond
+                    ;; A present-but-invalid signature is a tamper signal — refuse it
+                    ;; outright. Never fall back to honoring its (now unverified)
+                    ;; manifest, which could otherwise add capabilities like :secrets.
+                    (and sig (not signed?))
+                    (log/warn "Blocked external plugin with an invalid signature:" plugin-name
+                              "— present but does not verify (tampered or wrong key)")
+
+                    ;; require-signed mode — unsigned plugins are blocked entirely (M2b).
+                    (and require-signed? (not signed?))
+                    (log/warn "Blocked unsigned external plugin:" plugin-name
+                              "— signing is required ([:plugins :signing :require-signed])")
+
+                    :else
+                    (let [mf           (manifest/parse edn-str plugin-name)
+                          policy-trust (if (= "trusted" (:trust-level policy)) :trusted :sandboxed)
+                          ;; Signing gates :trusted — a trusted policy without a valid
+                          ;; signature is forced to :sandboxed (M2a). Policy alone can
+                          ;; never grant the fast lane to unattested bytes.
+                          gated-trust  (if (and (= policy-trust :trusted) (not signed?))
+                                         (do (log/warn "Plugin" plugin-name
+                                                       "has a trusted policy but no valid signature —"
+                                                       "forcing :sandboxed (M2a)")
+                                             :sandboxed)
+                                         policy-trust)
+                          trust        (manifest/effective-trust gated-trust (:requests-trust mf))
+                          caps         (:capabilities mf)]
+                      (doseq [w (:warnings mf)]
+                        (log/warn "Plugin manifest" (str plugin-name ":") w))
+                      (plugin-sci/eval-plugin
+                       {:plugin-name plugin-name :source source :trust trust :capabilities caps
+                        :ds ds :org-id org-id :secret-config secret-config})
+                      ;; Capability-grant audit (M2c): record + log the effective grant.
+                      (registry/record-grant! {:plugin plugin-name :trust trust
+                                               :capabilities (vec caps) :signed? signed?
+                                               :org-id org-id})
+                      (log/info "PLUGIN GRANT" plugin-name
+                                {:trust trust :capabilities (vec caps) :signed? signed?})
+                      (log/info "Loaded external plugin:" (.getName f)
+                                (str "[" (name trust)
+                                     (when (seq caps) (str " caps=" (vec caps))) "]")))))))
+            (catch Exception e
+              (log/warn "Failed to load external plugin"
+                        (.getName f) ":" (.getMessage e)))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Lifecycle
@@ -153,7 +200,9 @@
    (when-let [plugins-dir (get-in system [:config :plugins :directory])]
      (load-external-plugins! plugins-dir
                              :ds (:db system) :org-id nil
-                             :secret-config (:config system)))
+                             :secret-config (:config system)
+                             :signing-keys (get-in system [:config :plugins :signing :public-keys])
+                             :require-signed? (get-in system [:config :plugins :signing :require-signed])))
    (let [summary (registry/registry-summary)]
      (log/info "Plugins loaded:"
                (:plugins summary) "plugins,"

@@ -96,3 +96,13 @@
     (registry/reset-registry!)
     (is (empty? (registry/list-plugins)))
     (is (empty? (registry/list-step-executors)))))
+
+(deftest grant-audit-test
+  (testing "record-grant! / list-grants / get-grant, and reset clears them"
+    (registry/record-grant! {:plugin "p1" :trust :sandboxed :capabilities [:log] :signed? false})
+    (registry/record-grant! {:plugin "p2" :trust :trusted :capabilities [] :signed? true})
+    (is (= 2 (count (registry/list-grants))))
+    (is (= :trusted (:trust (registry/get-grant "p2"))))
+    (is (nil? (registry/get-grant "nope")))
+    (registry/reset-registry!)
+    (is (empty? (registry/list-grants)))))

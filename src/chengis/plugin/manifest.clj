@@ -77,22 +77,28 @@
      :requests-trust req-trust*
      :warnings       warnings}))
 
+(defn parse
+  "Validate a manifest from its raw EDN `edn-string` (nil/blank => empty
+   manifest). Unreadable/invalid EDN is downgraded to the empty manifest with a
+   warning — never throws. Use this when you already hold the manifest bytes
+   (e.g. the exact bytes covered by a signature) to avoid re-reading the file."
+  [edn-string plugin-name]
+  (if (str/blank? edn-string)
+    (validate {} plugin-name)
+    (try
+      (validate (edn/read-string edn-string) plugin-name)
+      (catch Exception e
+        (log/warn "Ignoring unreadable plugin manifest for" plugin-name ":" (.getMessage e))
+        (assoc (validate {} plugin-name)
+               :warnings [(str "unreadable manifest: " (.getMessage e))])))))
+
 (defn read-manifest
   "Read and validate the sidecar manifest for a plugin .clj File.
    Returns a validated manifest map (see `validate`). When the manifest is
-   absent, returns the empty/most-restrictive manifest. Unreadable/invalid EDN
-   is downgraded to the empty manifest with a warning — never throws."
+   absent, returns the empty/most-restrictive manifest. Never throws."
   [^java.io.File clj-file]
-  (let [plugin-name (plugin-base-name clj-file)
-        mf          (manifest-file clj-file)]
-    (if (.isFile mf)
-      (try
-        (validate (edn/read-string (slurp mf)) plugin-name)
-        (catch Exception e
-          (log/warn "Ignoring unreadable plugin manifest" (.getName mf) ":" (.getMessage e))
-          (assoc (validate {} plugin-name)
-                 :warnings [(str "unreadable manifest: " (.getMessage e))])))
-      (validate {} plugin-name))))
+  (let [mf (manifest-file clj-file)]
+    (parse (when (.isFile mf) (slurp mf)) (plugin-base-name clj-file))))
 
 (defn effective-trust
   "Compute the trust context a plugin actually runs in.

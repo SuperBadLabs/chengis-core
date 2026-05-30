@@ -16,7 +16,8 @@
          :artifact-handlers  {}   ;; handler-name -> ArtifactHandler instance
          :scm-providers      {}   ;; type-keyword -> ScmProvider instance
          :status-reporters   {}   ;; type-keyword -> ScmStatusReporter instance
-         :secret-backends    {}}));; backend-name -> SecretBackend instance
+         :secret-backends    {}   ;; backend-name -> SecretBackend instance
+         :grants             {}}));; plugin-name -> grant record (M2c audit)
 
 ;; ---------------------------------------------------------------------------
 ;; Plugin registration
@@ -191,6 +192,29 @@
   [plugin-name]
   (get-in @registry [:plugins plugin-name]))
 
+;; ---------------------------------------------------------------------------
+;; Capability-grant audit (M2c) — records what each external plugin was actually
+;; granted at load (trust context + capabilities + signed?), for admin visibility.
+;; ---------------------------------------------------------------------------
+
+(defn record-grant!
+  "Record the effective grant for a loaded external plugin. `grant` is a map
+   like {:plugin .. :trust .. :capabilities [..] :signed? bool :org-id ..}."
+  [grant]
+  (when-let [nm (:plugin grant)]
+    (swap! registry assoc-in [:grants nm] grant))
+  grant)
+
+(defn list-grants
+  "All recorded plugin capability grants (M2c audit)."
+  []
+  (vec (vals (:grants @registry))))
+
+(defn get-grant
+  "The recorded grant for a named plugin, or nil."
+  [plugin-name]
+  (get-in @registry [:grants plugin-name]))
+
 (defn registry-summary
   "Return a summary of the registry for admin/debug purposes."
   []
@@ -201,7 +225,8 @@
    :artifact-handlers (vec (keys (:artifact-handlers @registry)))
    :scm-providers     (vec (keys (:scm-providers @registry)))
    :status-reporters  (vec (keys (:status-reporters @registry)))
-   :secret-backends   (vec (keys (:secret-backends @registry)))})
+   :secret-backends   (vec (keys (:secret-backends @registry)))
+   :grants            (count (:grants @registry))})
 
 ;; ---------------------------------------------------------------------------
 ;; Reset (for testing)
@@ -212,4 +237,4 @@
   []
   (reset! registry {:plugins {} :step-executors {} :pipeline-formats {}
                     :notifiers {} :artifact-handlers {} :scm-providers {}
-                    :status-reporters {} :secret-backends {}}))
+                    :status-reporters {} :secret-backends {} :grants {}}))

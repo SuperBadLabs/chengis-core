@@ -102,3 +102,41 @@
                                  :trust-level "reviewed" :allowed true})
       (is (true? (store/plugin-allowed? ds "evolving-plugin" :org-id "org-1"))
           "After update should be allowed"))))
+
+;; --- Quarantine (M2b) ---------------------------------------------------------
+
+(deftest quarantine-upserts-and-flags-test
+  (testing "quarantine-plugin! creates a row when none exists, with reason"
+    (let [ds (conn/create-datasource test-db-path)]
+      (is (false? (store/quarantined? ds "vuln" :org-id "org-1"))
+          "no policy => not quarantined")
+      (store/quarantine-plugin! ds "vuln" "CVE-2026-9999" :org-id "org-1")
+      (is (true? (store/quarantined? ds "vuln" :org-id "org-1"))
+          "quarantine flag set after upsert")
+      (let [p (store/get-plugin-policy ds "vuln" :org-id "org-1")]
+        (is (= 1 (:quarantined p)))
+        (is (= "CVE-2026-9999" (:quarantine-reason p)))))))
+
+(deftest quarantine-preserves-and-unquarantine-clears-test
+  (testing "quarantine an existing allowed policy, then clear it"
+    (let [ds (conn/create-datasource test-db-path)]
+      (store/set-plugin-policy! ds {:org-id "org-1" :plugin-name "p"
+                                    :trust-level "trusted" :allowed true})
+      (store/quarantine-plugin! ds "p" "stale" :org-id "org-1")
+      (is (true? (store/quarantined? ds "p" :org-id "org-1")))
+      ;; allowlist untouched by quarantine
+      (is (true? (store/plugin-allowed? ds "p" :org-id "org-1"))
+          "quarantine is independent of the allowlist flag")
+      (store/unquarantine-plugin! ds "p" :org-id "org-1")
+      (is (false? (store/quarantined? ds "p" :org-id "org-1"))
+          "unquarantine clears the flag")
+      (is (true? (store/plugin-allowed? ds "p" :org-id "org-1"))
+          "allowlist still intact after unquarantine"))))
+
+(deftest list-policies-coerces-quarantined-bool-test
+  (testing "list-plugin-policies returns :quarantined as a boolean"
+    (let [ds (conn/create-datasource test-db-path)]
+      (store/quarantine-plugin! ds "q" "reason" :org-id "org-1")
+      (let [p (first (store/list-plugin-policies ds :org-id "org-1"))]
+        (is (true? (:quarantined p)))
+        (is (boolean? (:allowed p)))))))
