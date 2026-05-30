@@ -1,0 +1,52 @@
+(ns chengis.agent.heartbeat
+  "Periodic heartbeat from agent to master.
+   Uses chime for scheduling."
+  (:require [chengis.agent.client :as client]
+            [chime.core :as chime]
+            [taoensso.timbre :as log])
+  (:import [java.time Instant Duration]))
+
+;; ---------------------------------------------------------------------------
+;; Heartbeat scheduler
+;; ---------------------------------------------------------------------------
+
+(defonce ^:private heartbeat-scheduler (atom nil))
+
+(defn- close-scheduler! [sched]
+  (when sched
+    (clojure.lang.Reflector/invokeInstanceMethod sched "close" (object-array 0))))
+
+(defn- heartbeat-times
+  "Generate an infinite sequence of instants every `interval-ms` milliseconds."
+  [interval-ms]
+  (chime/periodic-seq (Instant/now) (Duration/ofMillis interval-ms)))
+
+(defn start-heartbeat!
+  "Start the periodic heartbeat to the master.
+   Stops any existing heartbeat scheduler first to prevent orphan schedules.
+   Returns the chime schedule."
+  [{:keys [master-url agent-id interval-ms config status-fn]}]
+  ;; Stop any existing scheduler to prevent orphan heartbeats (M6 fix)
+  (when-let [existing @heartbeat-scheduler]
+    (try (close-scheduler! existing) (catch Exception _))
+    (reset! heartbeat-scheduler nil)
+    (log/debug "Stopped previous heartbeat scheduler"))
+  (let [interval (or interval-ms 30000)
+        sched (chime/chime-at
+               (heartbeat-times interval)
+               (fn [_time]
+                 (let [status-info (when status-fn (status-fn))]
+                   (when-not (client/send-heartbeat! master-url agent-id
+                                                     (or status-info {}) config)
+                     (log/warn "Heartbeat failed — master may be unreachable")))))]
+    (reset! heartbeat-scheduler sched)
+    (log/info "Heartbeat started: every" interval "ms")
+    sched))
+
+(defn stop-heartbeat!
+  "Stop the heartbeat scheduler."
+  []
+  (when-let [sched @heartbeat-scheduler]
+    (close-scheduler! sched)
+    (reset! heartbeat-scheduler nil)
+    (log/info "Heartbeat stopped")))

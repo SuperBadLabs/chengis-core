@@ -1,0 +1,113 @@
+(ns chengis.plugin.protocol
+  "Protocols and contracts for the Chengis plugin system.
+   Each extension point defines a protocol that plugins implement.")
+
+;; ---------------------------------------------------------------------------
+;; Step Executor — executes a single build step
+;; ---------------------------------------------------------------------------
+
+(defprotocol StepExecutor
+  "Protocol for executing build steps.
+   Implementations receive a build-ctx and step-def, return a result map."
+  (execute-step [this build-ctx step-def]
+    "Execute a step. Returns:
+     {:exit-code int
+      :stdout string
+      :stderr string
+      :duration-ms long
+      :timed-out? boolean (optional)
+      :cancelled? boolean (optional)}"))
+
+;; ---------------------------------------------------------------------------
+;; Pipeline Format — parses pipeline definition files
+;; ---------------------------------------------------------------------------
+
+(defprotocol PipelineFormat
+  "Protocol for parsing pipeline definition files."
+  (parse-pipeline [this file-path]
+    "Parse a pipeline file. Returns:
+     {:pipeline {...}} on success
+     {:error \"message\"} on failure")
+  (detect-file [this workspace-dir]
+    "Check if this format's file exists in the workspace.
+     Returns the file path if found, nil otherwise."))
+
+;; ---------------------------------------------------------------------------
+;; Notifier — sends build notifications
+;; ---------------------------------------------------------------------------
+
+(defprotocol Notifier
+  "Protocol for sending build notifications."
+  (send-notification [this build-result config]
+    "Send a notification. Returns:
+     {:status :sent/:failed
+      :details \"message\"}"))
+
+;; ---------------------------------------------------------------------------
+;; Artifact Handler — collects and stores build artifacts
+;; ---------------------------------------------------------------------------
+
+(defprotocol ArtifactHandler
+  "Protocol for collecting and storing build artifacts."
+  (collect-artifacts [this workspace-dir artifact-dir patterns]
+    "Collect artifacts matching patterns. Returns seq of:
+     [{:filename :path :size-bytes :content-type}]"))
+
+;; ---------------------------------------------------------------------------
+;; SCM Provider — source code management operations
+;; ---------------------------------------------------------------------------
+
+(defprotocol ScmProvider
+  "Protocol for source code management operations."
+  (checkout-source [this source-config workspace-dir commit-override]
+    "Clone/checkout source code. Returns:
+     {:success? boolean
+      :git-info {:commit :branch :author ...}
+      :error \"message\" (on failure)}"))
+
+;; ---------------------------------------------------------------------------
+;; SCM Status Reporter — reports build status back to SCM (GitHub, GitLab)
+;; ---------------------------------------------------------------------------
+
+(defprotocol ScmStatusReporter
+  "Protocol for reporting build status to SCM providers (GitHub, GitLab, etc.)."
+  (report-status [this build-info config]
+    "Report build status to the SCM provider. build-info contains:
+     :commit-sha :repo-url :status :build-url :description :context
+     Returns {:status :sent/:failed :details \"message\"}"))
+
+;; ---------------------------------------------------------------------------
+;; Secret Backend — pluggable secret storage
+;; ---------------------------------------------------------------------------
+
+(defprotocol SecretBackend
+  "Protocol for external secret store integration.
+   Implementations can wrap HashiCorp Vault, AWS Secrets Manager, etc.
+   The builtin implementation wraps the existing AES-256-GCM encrypted DB store.
+
+   Org-ID scoping: Implementations should check for :org-id in the config map
+   to scope secret access per organization. When :org-id is present, only secrets
+   belonging to that organization should be returned."
+  (fetch-secret [this secret-name scope config]
+    "Fetch a single secret value. Returns the plaintext string, or nil if not found.
+     scope is \"global\" or a job-id. config may contain :org-id for org scoping.")
+  (list-secrets [this scope config]
+    "List secret names (never values) for a scope. Returns a vector of name strings.
+     config may contain :org-id for org scoping.")
+  (fetch-secrets-for-build [this job-id config]
+    "Fetch all secrets for a build as a map of {name value}.
+     Merges global secrets with job-scoped secrets (job overrides global).
+     config may contain :org-id for org scoping."))
+
+;; ---------------------------------------------------------------------------
+;; Plugin descriptor
+;; ---------------------------------------------------------------------------
+
+(defn plugin-descriptor
+  "Create a standard plugin descriptor map."
+  [name version description & {:keys [provides config-spec]}]
+  {:name name
+   :version version
+   :description description
+   :provides (or provides #{})
+   :config-spec (or config-spec {})})

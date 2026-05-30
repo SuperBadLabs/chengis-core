@@ -1,0 +1,1 @@
+# chengis-core ships an empty migrations dir so consuming products that don't supply their own --migrations-dir at least get a valid (no-op) classpath path. Real product schemas go in the consumer's resources/migrations/.
