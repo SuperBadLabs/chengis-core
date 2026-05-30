@@ -1,31 +1,42 @@
 (ns ^:integration chengis.plugin.loader-trust-test
-  "Tests for plugin loader trust enforcement: allowed, blocked,
-   and backward-compatible (no DB) loading."
+  "Tests for plugin loader trust enforcement: allowed, blocked, and
+   backward-compatible (no DB) loading.
+
+   Post-M1b: external plugins are evaluated through the SCI runtime, not
+   `load-file`. A loaded plugin is observed by the side effect it produces via
+   the host API (registering a notifier), NOT by a host namespace appearing —
+   SCI plugins never create host-visible namespaces."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [chengis.db.connection :as conn]
             [chengis.db.migrate :as migrate]
             [chengis.db.plugin-policy-store :as plugin-policy-store]
             [chengis.plugin.loader]
+            [chengis.plugin.registry :as registry]
             [clojure.java.io :as io]))
 
 (def test-db-path "/tmp/chengis-loader-trust-test.db")
 (def test-plugin-dir "/tmp/chengis-loader-trust-plugins")
 
+;; SCI plugin source: registers a notifier of the given type via the host API.
+(defn- plugin-src [notifier-kw]
+  (str "(require '[chengis.plugin.host :as h]) "
+       "(h/register-notifier! " notifier-kw
+       " (fn [br cfg] {:status :sent}))"))
+
 (defn setup [f]
+  (registry/reset-registry!)
   ;; Setup DB
   (let [db-file (io/file test-db-path)]
     (when (.exists db-file) (.delete db-file)))
   (migrate/migrate! test-db-path)
-  ;; Setup plugin directory with test plugins
+  ;; Setup plugin directory with SCI-style test plugins
   (let [dir (io/file test-plugin-dir)]
     (.mkdirs dir)
-    ;; Create test plugin files
-    (spit (io/file dir "allowed-test.clj")
-          "(ns allowed-test) (def loaded? true)")
-    (spit (io/file dir "blocked-test.clj")
-          "(ns blocked-test) (def loaded? true)"))
+    (spit (io/file dir "allowed-test.clj") (plugin-src ":allowed-test"))
+    (spit (io/file dir "blocked-test.clj") (plugin-src ":blocked-test")))
   (f)
   ;; Cleanup
+  (registry/reset-registry!)
   (let [db-file (io/file test-db-path)]
     (when (.exists db-file) (.delete db-file)))
   (doseq [^java.io.File plugin-file (.listFiles ^java.io.File (io/file test-plugin-dir))]
@@ -34,48 +45,37 @@
 
 (use-fixtures :each setup)
 
+(defn- load-external! [& args]
+  (apply (var-get #'chengis.plugin.loader/load-external-plugins!) args))
+
 (deftest allowed-plugin-loads-test
-  (testing "plugin with allowed=true policy loads successfully"
+  (testing "plugin with allowed=true policy loads and registers via the host API"
     (let [ds (conn/create-datasource test-db-path)]
-      ;; Allow the test plugin
       (plugin-policy-store/set-plugin-policy! ds
                                               {:org-id nil :plugin-name "allowed-test"
                                                :trust-level "trusted" :allowed true :created-by "test"})
-      ;; Load external plugins with trust enforcement
-      ;; We need to call the private function, but we can test via the public load-plugins! API
-      ;; Instead, we directly invoke load-external-plugins! via its private var
-      (let [load-fn (var-get #'chengis.plugin.loader/load-external-plugins!)]
-        (load-fn test-plugin-dir :ds ds :org-id nil))
-      ;; The allowed plugin should have been loaded
-      (is (some? (find-ns 'allowed-test))
-          "allowed-test namespace should be loaded"))))
+      (load-external! test-plugin-dir :ds ds :org-id nil)
+      (is (some? (registry/get-notifier :allowed-test))
+          "allowed-test should have registered its notifier"))))
 
 (deftest blocked-plugin-skipped-test
-  (testing "plugin without allowed policy is skipped"
+  (testing "plugin without allowed policy is skipped (never evaluated)"
     (let [ds (conn/create-datasource test-db-path)]
       ;; Only allow 'allowed-test', NOT 'blocked-test'
       (plugin-policy-store/set-plugin-policy! ds
                                               {:org-id nil :plugin-name "allowed-test"
                                                :trust-level "trusted" :allowed true :created-by "test"})
-      ;; Remove blocked-test ns if it was loaded by a previous test
-      (when (find-ns 'blocked-test)
-        (remove-ns 'blocked-test))
-      ;; Load external plugins
-      (let [load-fn (var-get #'chengis.plugin.loader/load-external-plugins!)]
-        (load-fn test-plugin-dir :ds ds :org-id nil))
-      ;; blocked-test should NOT have been loaded
-      (is (nil? (find-ns 'blocked-test))
-          "blocked-test namespace should NOT be loaded"))))
+      (load-external! test-plugin-dir :ds ds :org-id nil)
+      (is (nil? (registry/get-notifier :blocked-test))
+          "blocked-test must NOT have registered anything")
+      (is (some? (registry/get-notifier :allowed-test))
+          "allowed-test should still load"))))
 
 (deftest no-db-loads-all-plugins-test
-  (testing "when no DB is provided, all external plugins load (backward compat)"
-    ;; Remove both namespaces if they exist
-    (when (find-ns 'allowed-test) (remove-ns 'allowed-test))
-    (when (find-ns 'blocked-test) (remove-ns 'blocked-test))
-    ;; Load without ds — should load everything
-    (let [load-fn (var-get #'chengis.plugin.loader/load-external-plugins!)]
-      (load-fn test-plugin-dir))
-    (is (some? (find-ns 'allowed-test))
-        "allowed-test should be loaded without DB enforcement")
-    (is (some? (find-ns 'blocked-test))
-        "blocked-test should also be loaded without DB enforcement")))
+  (testing "when no DB is provided, all external plugins load (backward compat),
+            but in the sandboxed context"
+    (load-external! test-plugin-dir)
+    (is (some? (registry/get-notifier :allowed-test))
+        "allowed-test should load without DB enforcement")
+    (is (some? (registry/get-notifier :blocked-test))
+        "blocked-test should also load without DB enforcement")))

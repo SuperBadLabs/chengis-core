@@ -37,6 +37,8 @@
                  [migratus/migratus "1.6.5"]
                  ;; Subprocess primitives used by chengis.engine.process
                  [babashka/process "0.6.25"]
+                 ;; SCI — sandboxed/trusted runtime for chengis.plugin.sci
+                 [org.babashka/sci "0.9.44"]
                  ;; YAML — chengis.dsl.yaml + workflow config readers
                  [clj-commons/clj-yaml "1.0.29"]
                  ;; JSON — agent client, license scanner, notify

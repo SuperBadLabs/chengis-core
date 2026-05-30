@@ -2,7 +2,9 @@
   "Plugin discovery and lifecycle management.
    Loads builtin plugins and external plugins from the plugins directory."
   (:require [chengis.db.plugin-policy-store :as plugin-policy-store]
+            [chengis.plugin.manifest :as manifest]
             [chengis.plugin.registry :as registry]
+            [chengis.plugin.sci :as plugin-sci]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [taoensso.timbre :as log]))
@@ -56,17 +58,35 @@
       (log/warn "Failed to load plugin" ns-sym ":" (.getMessage e))
       false)))
 
+(defn- policy-trust-level
+  "The authoritative trust ceiling for an external plugin, from policy.
+   A policy with trust-level \"trusted\" (set by an admin; M2 will tie this to
+   signing/provenance) permits the fast :trusted lane. Everything else —
+   including the no-DB backward-compat path — caps at the hardened :sandboxed
+   lane. The plugin's manifest can only lower this further (see manifest/
+   effective-trust), never raise it."
+  [ds plugin-name org-id]
+  (let [policy (when ds (plugin-policy-store/get-plugin-policy ds plugin-name :org-id org-id))]
+    (if (= "trusted" (:trust-level policy)) :trusted :sandboxed)))
+
 (defn- load-external-plugins!
-  "Load external plugins from the plugins directory.
-   Each plugin is a .clj file with a namespace that has an init! function.
+  "Load external plugins from the plugins directory through the SCI runtime.
 
-   When a datasource is provided, checks plugin trust policy before loading.
-   Plugins without an explicit 'allowed' policy are blocked.
-   When no datasource is provided (backward compat), all plugins load.
+   Each plugin is a .clj file evaluated by `chengis.plugin.sci/eval-plugin` —
+   NOT `load-file`. The authoring contract is the SCI host API: a plugin calls
+   `(chengis.plugin.host/register-* ...)` rather than defining a host namespace.
+   Arbitrary in-process Clojure (the old `load-file` model) is no longer run.
 
-   SECURITY NOTE: External plugins execute arbitrary Clojure code.
-   Only place trusted .clj files in the plugins directory."
-  [plugins-dir & {:keys [ds org-id]}]
+   Trust routing:
+   - When a datasource is provided, an explicit `allowed=true` policy is still
+     required to load at all; trust-level then selects :trusted vs :sandboxed.
+   - When no datasource is provided (backward compat), all plugins load but in
+     the :sandboxed context — no DB means no trust, so nothing gets the fast lane.
+
+   Capabilities and any self-imposed trust restriction come from an optional
+   `<plugin>.edn` manifest (see `chengis.plugin.manifest`). The manifest can
+   only narrow privilege, never widen it."
+  [plugins-dir & {:keys [ds org-id secret-config]}]
   (let [^java.io.File dir (io/file plugins-dir)]
     (when (.isDirectory dir)
       (let [plugin-files (->> (or (.listFiles dir) (make-array java.io.File 0))
@@ -77,20 +97,31 @@
         (when (seq plugin-files)
           (if ds
             (log/info "Loading" (count plugin-files) "external plugin(s) from" plugins-dir
-                      "with trust policy enforcement")
+                      "via SCI with trust policy enforcement")
             (log/warn "Loading" (count plugin-files) "external plugin(s) from" plugins-dir
-                      "— no trust policy enforcement (no DB). Ensure you trust all files.")))
+                      "via SCI — no DB, so all run sandboxed.")))
         (doseq [^java.io.File f plugin-files]
           (let [plugin-name (str/replace (.getName f) #"\.clj$" "")]
             (if (and ds (not (plugin-policy-store/plugin-allowed? ds plugin-name :org-id org-id)))
               (log/warn "Blocked untrusted external plugin:" plugin-name
                         "— add to allowlist via Admin > Plugin Policies")
-              (try
-                (load-file (.getAbsolutePath f))
-                (log/info "Loaded external plugin:" (.getName f))
-                (catch Exception e
-                  (log/warn "Failed to load external plugin"
-                            (.getName f) ":" (.getMessage e)))))))))))
+              (let [mf           (manifest/read-manifest f)
+                    policy-trust (policy-trust-level ds plugin-name org-id)
+                    trust        (manifest/effective-trust policy-trust (:requests-trust mf))
+                    caps         (:capabilities mf)]
+                (doseq [w (:warnings mf)]
+                  (log/warn "Plugin manifest" (str plugin-name ":") w))
+                (try
+                  (plugin-sci/eval-plugin-file
+                   (.getAbsolutePath f)
+                   {:plugin-name plugin-name :trust trust :capabilities caps
+                    :ds ds :org-id org-id :secret-config secret-config})
+                  (log/info "Loaded external plugin:" (.getName f)
+                            (str "[" (name trust)
+                                 (when (seq caps) (str " caps=" (vec caps))) "]"))
+                  (catch Exception e
+                    (log/warn "Failed to load external plugin"
+                              (.getName f) ":" (.getMessage e))))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Lifecycle
@@ -120,7 +151,9 @@
          (load-plugin-ns! ns-sym))))
    ;; Load external plugins from configured directory (with trust policy enforcement)
    (when-let [plugins-dir (get-in system [:config :plugins :directory])]
-     (load-external-plugins! plugins-dir :ds (:db system) :org-id nil))
+     (load-external-plugins! plugins-dir
+                             :ds (:db system) :org-id nil
+                             :secret-config (:config system)))
    (let [summary (registry/registry-summary)]
      (log/info "Plugins loaded:"
                (:plugins summary) "plugins,"
