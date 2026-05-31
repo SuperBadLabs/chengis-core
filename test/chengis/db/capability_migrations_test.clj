@@ -205,22 +205,61 @@
                (cm/load-bundled-manifest "postgresql"))))))
 
 (deftest bundled-manifests-anvil-default-vs-chengis-default
-  (testing "with no capabilities enabled, the SQLite manifest hides the enterprise migrations"
+  (testing "with no capabilities enabled, the SQLite manifest hides the leaf enterprise migrations"
     (let [m (cm/load-bundled-manifest "sqlite")
           gated (->> (vals (:tags m))
                      (remove #{:core})
                      set)]
-      ;; sanity: the manifest does tag enterprise things
-      (is (contains? gated :multi-tenant))
-      (is (contains? gated :audit-chain))
+      ;; sanity: the manifest does tag enterprise things. Several caps
+      ;; have NO tagged migrations anymore — they gate behavior, not
+      ;; schema. Those are: :audit-chain (round 5), :multi-tenant
+      ;; (round 7). Their migrations stay :core because flag-gated or
+      ;; always-on subsystems depend on the tables.
       (is (contains? gated :saml))
-      ;; with no caps on, all gated migrations are filtered out
-      (let [eg-migration "025-organizations"]
-        (is (false? (cm/migration-applies? m eg-migration #{}))))))
-  (testing "with the chengis default bundle, all listed enterprise migrations apply"
+      (is (contains? gated :iac))
+      (is (contains? gated :deployments))
+      ;; with no caps on, gated migrations are filtered out
+      (is (false? (cm/migration-applies? m "051-saml-identities" #{})))
+      (is (false? (cm/migration-applies? m "070-iac-projects" #{})))
+      ;; Pin the :core-by-design migrations so future PRs that re-tag
+      ;; them have to also handle the dependency that put them in :core.
+      (is (= :core (or (get-in m [:tags "025-organizations"]) :core))
+          "025-organizations stays :core (24 downstream migrations depend on org_id)")
+      (is (= :core (or (get-in m [:tags "036-audit-seq-num"]) :core))
+          "036-audit-seq-num stays :core (audit writer is always-on)")
+      (is (= :core (or (get-in m [:tags "097-audit-prev-hash-unique"]) :core))
+          "097 stays :core (same audit pipeline)")
+      (is (= :core (or (get-in m [:tags "086-org-invitations"]) :core))
+          "086-org-invitations stays :core (org-management UI flag fires independently)")
+      (is (= :core (or (get-in m [:tags "078-org-quotas"]) :core))
+          "078-org-quotas stays :core (org-management UI flag fires independently)")
+      (is (= :core (or (get-in m [:tags "092-org-branding"]) :core))
+          "092-org-branding stays :core (round 7)")))
+  (testing "with the chengis default bundle on Postgres, all listed enterprise migrations apply"
     (let [m (cm/load-bundled-manifest "sqlite")
-          chengis-caps (cap/effective-set {} :chengis)]
+          chengis-caps (cap/effective-set {:database {:type "postgresql"}} :chengis)]
       (doseq [[mid cap-key] (:tags m)
               :when (not= cap-key :core)]
         (is (cm/migration-applies? m mid chengis-caps)
-            (str mid " (tagged " cap-key ") should apply under chengis-default but didn't"))))))
+            (str mid " (tagged " cap-key ") should apply under chengis-default + PG but didn't")))))
+  (testing "under chengis + SQLite (dev/demo), the right migrations are filtered out and the right ones stay"
+    (let [m (cm/load-bundled-manifest "sqlite")
+          chengis-sqlite (cap/effective-set {:database {:type "sqlite"}} :chengis)]
+      ;; Behavior-gating caps with no tagged migrations don't affect
+      ;; the filter — multi-tenant schema is universal (round 7).
+      ;; Things still demoted on sqlite are non-multi-tenant + non-audit caps.
+      ;; All multi-tenant schema migrations still apply (now :core):
+      (is (true? (cm/migration-applies? m "092-org-branding" chengis-sqlite))
+          "092-org-branding is :core after round 7 (org-management UI flag fires independently)")
+      (is (true? (cm/migration-applies? m "086-org-invitations" chengis-sqlite)))
+      ;; non-PG-only caps still apply (saml etc.)
+      (is (true? (cm/migration-applies? m "051-saml-identities" chengis-sqlite)))
+      ;; The foundational migrations stay :core — even chengis-on-sqlite
+      ;; keeps them. Each represents a substrate that an always-on
+      ;; subsystem depends on, so demoting them would break boot.
+      (is (true? (cm/migration-applies? m "025-organizations" chengis-sqlite))
+          "025-organizations is :core (24 downstream migrations reference org_id)")
+      (is (true? (cm/migration-applies? m "036-audit-seq-num" chengis-sqlite))
+          "036-audit-seq-num is :core (audit writer is always-on and references seq_num)")
+      (is (true? (cm/migration-applies? m "097-audit-prev-hash-unique" chengis-sqlite))
+          "097 is :core (same audit pipeline)"))))

@@ -883,7 +883,12 @@
   ;; No-op (returns nil) when no profile has been declared — tests and
   ;; ad-hoc scripts don't get a capability surface either.
   (when-some [p (product/profile)]
-    (capability/set-active! cfg p))
+    (capability/set-active! cfg p)
+    ;; Hard-reject capabilities whose :requires-database doesn't match
+    ;; the configured DB type. Unlike the off-preferred-DB warn, this
+    ;; is a structural correctness check — audit-chain literally
+    ;; cannot function on SQLite, regardless of strict mode.
+    (capability/validate-capability-requirements! cfg p))
   nil)
 
 (defn validate-production-config!
