@@ -51,7 +51,18 @@
                            :from "chengis@localhost"
                            :default-recipients []}}
    :cleanup {:enabled false :interval-hours 24 :retention-builds 10}
-   :plugins {:directory "plugins" :enabled []}
+   :plugins {:directory "plugins" :enabled []
+             ;; Plugin provenance (M2a/M3a). :public-keys is a vector of trusted
+             ;; Ed25519 signing keys; each entry is either a base64 X.509 SPKI
+             ;; string (an always-active key) or a map
+             ;;   {:key "<base64 SPKI>" :status :active|:revoked
+             ;;    :label "..." :added "..." :revoked-at "..." :reason "..."}
+             ;; Rotation = add a new key alongside the old; revocation = flip the
+             ;; old key to {:status :revoked} (it stops verifying immediately but
+             ;; stays for audit). Generate keys with `chengis sign-plugin keygen`.
+             ;; When :require-signed is true, unsigned plugins are blocked entirely.
+             :signing {:public-keys []
+                       :require-signed false}}
    :docker {:host "unix:///var/run/docker.sock"
             :default-timeout 600000
             :pull-policy :if-not-present}

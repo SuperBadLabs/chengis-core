@@ -116,15 +116,19 @@
                 ;; evaluate exactly these bytes (no re-read between check and use,
                 ;; TOCTOU-safe). The signature covers BOTH source and manifest, so
                 ;; tampering either invalidates it.
-                (let [source   (slurp f)
-                      edn-file (manifest/manifest-file f)
-                      edn-str  (when (.isFile edn-file) (slurp edn-file))
-                      sig      (signing/read-signature f)
-                      signed?  (boolean
-                                (and sig
-                                     (signing/verify-payload? (.getBytes source "UTF-8")
-                                                              (when edn-str (.getBytes edn-str "UTF-8"))
-                                                              sig signing-keys)))]
+                (let [source    (slurp f)
+                      edn-file  (manifest/manifest-file f)
+                      edn-str   (when (.isFile edn-file) (slurp edn-file))
+                      sig       (signing/read-signature f)
+                      ;; verifying-key-id returns the key-id of the active key
+                      ;; that verified (provenance: 'who signed'), or nil. A
+                      ;; revoked key never matches, so a plugin signed only by a
+                      ;; now-revoked key reads as unsigned here.
+                      signed-by (when sig
+                                  (signing/verifying-key-id (.getBytes source "UTF-8")
+                                                            (when edn-str (.getBytes edn-str "UTF-8"))
+                                                            sig signing-keys))
+                      signed?   (boolean signed-by)]
                   (cond
                     ;; A present-but-invalid signature is a tamper signal — refuse it
                     ;; outright. Never fall back to honoring its (now unverified)
@@ -160,9 +164,11 @@
                       ;; Capability-grant audit (M2c): record + log the effective grant.
                       (registry/record-grant! {:plugin plugin-name :trust trust
                                                :capabilities (vec caps) :signed? signed?
+                                               :signed-by signed-by
                                                :org-id org-id})
                       (log/info "PLUGIN GRANT" plugin-name
-                                {:trust trust :capabilities (vec caps) :signed? signed?})
+                                {:trust trust :capabilities (vec caps)
+                                 :signed? signed? :signed-by signed-by})
                       (log/info "Loaded external plugin:" (.getName f)
                                 (str "[" (name trust)
                                      (when (seq caps) (str " caps=" (vec caps))) "]")))))))

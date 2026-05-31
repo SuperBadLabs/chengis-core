@@ -31,7 +31,7 @@
             [clojure.string :as str]
             [taoensso.timbre :as log])
   (:import [java.io ByteArrayOutputStream DataOutputStream]
-           [java.security KeyFactory Signature]
+           [java.security KeyFactory MessageDigest Signature]
            [java.security.spec X509EncodedKeySpec]
            [java.util Base64]))
 
@@ -48,6 +48,56 @@
     (catch Exception e
       (log/warn "Ignoring invalid plugin signing public-key:" (.getMessage e))
       nil)))
+
+(defn key-id
+  "Stable short fingerprint for a configured public key: the first 16 lowercase
+   hex chars of the SHA-256 of its decoded X.509 SPKI bytes. Lets operators and
+   audit logs name a key ('which key signed this?', 'revoke key abcd…') without
+   echoing the whole blob. Returns nil for an unparseable key."
+  [^String b64]
+  (try
+    (let [spki (b64-decode b64)
+          dig  (.digest (MessageDigest/getInstance "SHA-256") spki)]
+      (->> (take 8 dig)
+           (map #(format "%02x" (bit-and (int %) 0xff)))
+           (apply str)))
+    (catch Exception _ nil)))
+
+(defn normalize-key
+  "Coerce one configured signing-key entry into a canonical map
+     {:key <base64 SPKI> :status :active|:revoked :id <key-id>
+      :label .. :added .. :revoked-at .. :reason ..}
+   so the config can carry key lifecycle metadata. A plain string entry is a
+   bare active key (the original config shape — fully backward compatible). Map
+   entries may add :label/:status/:reason etc.; only `:status :revoked` retires
+   a key. :id is always (re)derived from the key bytes — operators can't mislabel
+   which physical key a row points at. Returns nil for entries with no usable
+   :key string."
+  [entry]
+  (let [m (cond (string? entry) {:key entry}
+                (map? entry)    entry
+                :else           nil)]
+    (when (and m (string? (:key m)))
+      (let [status (if (= :revoked (some-> (:status m) name keyword)) :revoked :active)]
+        (assoc m :status status :id (or (key-id (:key m)) (:id m)))))))
+
+(defn normalize-keys
+  "Normalize the configured signing keys (a seq of base64 strings and/or maps)
+   into canonical key maps (see `normalize-key`), dropping entries with no
+   usable :key."
+  [configured]
+  (->> (or configured []) (keep normalize-key) vec))
+
+(defn active-public-keys
+  "Base64 SPKI strings for the keys that are currently :active (not :revoked).
+   This is the single revocation chokepoint: flip a key to `:status :revoked`
+   in config and it stops verifying signatures immediately, while its row stays
+   for provenance/audit. Accepts the same mixed string/map config that
+   `normalize-keys` does — so a plain string vector still yields all keys active."
+  [configured]
+  (->> (normalize-keys configured)
+       (filter #(= :active (:status %)))
+       (mapv :key)))
 
 (defn verify
   "True if `sig` (raw Ed25519 signature bytes) over `data` verifies against
@@ -86,16 +136,27 @@
              (log/warn "Unreadable plugin signature" (.getName sig-file) ":" (.getMessage e))
              nil)))))
 
+(defn verifying-key-id
+  "The `key-id` of the FIRST currently-active configured key whose signature
+   verifies the (clj + manifest) payload, or nil if none do. `public-keys` is
+   the mixed string/map signing-key config; revoked keys are skipped. This is
+   the provenance hook — the loader records 'who signed' from this id. Use with
+   bytes you've already read once (TOCTOU-safe; no re-read between check & use)."
+  [^bytes clj-bytes edn-bytes ^bytes sig public-keys]
+  (when (and sig clj-bytes)
+    (let [payload (signed-payload clj-bytes edn-bytes)]
+      (some (fn [b64]
+              (when-let [pk (load-public-key b64)]
+                (when (verify payload sig pk) (key-id b64))))
+            (active-public-keys public-keys)))))
+
 (defn verify-payload?
-  "True iff `sig` verifies the (clj + manifest) `signed-payload` against ANY of
-   `public-keys` (base64 SPKI). Use this with bytes you have already read once
+  "True iff `sig` verifies the (clj + manifest) `signed-payload` against ANY
+   currently-active configured key (revoked keys are ignored — see
+   `active-public-keys`). Use this with bytes you have already read once
    (avoids re-reading the file between verify and use)."
   [^bytes clj-bytes edn-bytes ^bytes sig public-keys]
-  (let [keys (keep load-public-key (or public-keys []))]
-    (boolean
-     (when (and (seq keys) sig clj-bytes)
-       (let [payload (signed-payload clj-bytes edn-bytes)]
-         (boolean (some #(verify payload sig %) keys)))))))
+  (boolean (verifying-key-id clj-bytes edn-bytes sig public-keys)))
 
 (defn verified-file?
   "Convenience for callers that don't already hold the bytes: read `clj-file`,
