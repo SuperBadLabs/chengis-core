@@ -10,6 +10,7 @@
             [chengis.db.connection :as conn]
             [chengis.db.migrate :as migrate]
             [chengis.db.plugin-policy-store :as plugin-policy-store]
+            [chengis.db.plugin-grant-audit-store :as grant-audit-store]
             [chengis.plugin.loader]
             [chengis.plugin.registry :as registry]
             [clojure.java.io :as io]))
@@ -56,7 +57,14 @@
                                                :trust-level "trusted" :allowed true :created-by "test"})
       (load-external! test-plugin-dir :ds ds :org-id nil)
       (is (some? (registry/get-notifier :allowed-test))
-          "allowed-test should have registered its notifier"))))
+          "allowed-test should have registered its notifier")
+      ;; M3c — the load is persisted to the grant-audit trail.
+      (let [rows (grant-audit-store/list-grant-audit ds :org-id nil)
+            row  (first (filter #(= "allowed-test" (:plugin-name %)) rows))]
+        (is (some? row) "an allowed-test grant-audit row was persisted")
+        (is (= "sandboxed" (:trust-level row))
+            "unsigned plugin is recorded as sandboxed even under a trusted policy")
+        (is (false? (:signed row)) "recorded as unsigned (no .sig present)")))))
 
 (deftest blocked-plugin-skipped-test
   (testing "plugin without allowed policy is skipped (never evaluated)"

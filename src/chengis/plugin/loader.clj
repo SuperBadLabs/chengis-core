@@ -1,7 +1,8 @@
 (ns chengis.plugin.loader
   "Plugin discovery and lifecycle management.
    Loads builtin plugins and external plugins from the plugins directory."
-  (:require [chengis.db.plugin-policy-store :as plugin-policy-store]
+  (:require [chengis.db.plugin-grant-audit-store :as plugin-grant-audit-store]
+            [chengis.db.plugin-policy-store :as plugin-policy-store]
             [chengis.plugin.manifest :as manifest]
             [chengis.plugin.registry :as registry]
             [chengis.plugin.sci :as plugin-sci]
@@ -166,6 +167,17 @@
                                                :capabilities (vec caps) :signed? signed?
                                                :signed-by signed-by
                                                :org-id org-id})
+                      ;; Persistent grant-audit trail (M3c) — survives restart,
+                      ;; unlike the in-memory registry. Best-effort: a DB hiccup
+                      ;; must never block loading an otherwise-cleared plugin.
+                      (when ds
+                        (try
+                          (plugin-grant-audit-store/record-grant-audit!
+                           ds {:org-id org-id :plugin-name plugin-name :trust-level trust
+                               :capabilities (vec caps) :signed? signed? :signed-by signed-by})
+                          (catch Exception e
+                            (log/warn "Failed to persist plugin grant audit for" plugin-name
+                                      ":" (.getMessage e)))))
                       (log/info "PLUGIN GRANT" plugin-name
                                 {:trust trust :capabilities (vec caps)
                                  :signed? signed? :signed-by signed-by})
