@@ -2,7 +2,9 @@
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [taoensso.timbre :as log]))
+            [taoensso.timbre :as log]
+            [chengis.product :as product]
+            [chengis.product.capability :as capability]))
 
 (def default-config
   {:database {:type "sqlite"    ;; "sqlite" or "postgresql"
@@ -846,13 +848,32 @@
 
 (defn validate-runtime-config!
   "Validate non-optional runtime configuration regardless of environment.
-   Throws ex-info for invalid settings."
+   Throws ex-info for invalid settings.
+
+   Includes the product-vs-DB fit gate
+   (`chengis.product/validate-database-fit!`): off-preferred combos
+   (anvil + Postgres, chengis + SQLite) log a `[product-fit]` warning
+   by default and throw under strict mode (CHENGIS_STRICT_PROFILE=true).
+   Also resolves the effective capability set for subsystem queries.
+   If no profile has been declared (e.g. test runner or REPL), both
+   the fit check and the capability resolve are no-ops."
   [cfg]
   (when (and (get-in cfg [:distributed :enabled])
              (str/blank? (get-in cfg [:distributed :auth-token])))
     (throw (ex-info "Distributed mode enabled but :distributed :auth-token is not set. Set CHENGIS_DISTRIBUTED_AUTH_TOKEN or disable distributed mode."
                     {:type :config-validation-error
-                     :field [:distributed :auth-token]}))))
+                     :field [:distributed :auth-token]})))
+  ;; Discard the fit-report return value — the function logs / throws
+  ;; as a side effect; existing callers (and their tests) expect a
+  ;; nil-return contract from validate-runtime-config!.
+  (product/validate-database-fit! cfg)
+  ;; Resolve the effective capability set for the active profile and
+  ;; stash it for subsystem queries (has-capability? / require-capability!).
+  ;; No-op (returns nil) when no profile has been declared — tests and
+  ;; ad-hoc scripts don't get a capability surface either.
+  (when-some [p (product/profile)]
+    (capability/set-active! cfg p))
+  nil)
 
 (defn validate-production-config!
   "Validate that production-critical security settings are properly configured.
