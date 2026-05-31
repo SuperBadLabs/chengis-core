@@ -63,6 +63,14 @@
              ;; When :require-signed is true, unsigned plugins are blocked entirely.
              :signing {:public-keys []
                        :require-signed false}}
+   ;; Pipeline DSL (.clj) evaluation. :eval-mode :sandboxed (default) runs
+   ;; pipeline-definition files in an SCI sandbox — only the DSL vocabulary +
+   ;; safe clojure.core, no Java interop / eval / filesystem, with a wall-clock
+   ;; timeout. :trusted falls back to raw load-file (full JVM privileges) for
+   ;; operators who knowingly run full-power pipeline files. See
+   ;; chengis.dsl.sandbox / chengis.dsl.core/load-pipeline-file.
+   :dsl {:eval-mode :sandboxed
+         :timeout-ms 5000}
    :docker {:host "unix:///var/run/docker.sock"
             :default-timeout 600000
             :pull-policy :if-not-present}

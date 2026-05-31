@@ -12,7 +12,8 @@
            (step \"Lint\" (sh \"mvn checkstyle:check\"))))
        (stage \"Deploy\"
          (when-branch \"main\"
-           (step \"Deploy\" (sh \"./deploy.sh\" :env {\"ENV\" \"prod\"})))))")
+           (step \"Deploy\" (sh \"./deploy.sh\" :env {\"ENV\" \"prod\"})))))"
+  (:require [chengis.dsl.sandbox :as sandbox]))
 
 ;; Registry of defined pipelines
 (defonce ^:private pipeline-registry (atom {}))
@@ -199,21 +200,55 @@
   []
   (reset! pipeline-registry {}))
 
+(defn- defpipeline-sci-macro
+  "Host-macro form of `defpipeline` for the SCI sandbox: SCI invokes it with
+   &form &env prepended and uses the returned form as the expansion. Mirrors the
+   `defpipeline` macro, but the expansion references the fully-qualified vocab
+   fns registered in the sandbox's `chengis.dsl.core` namespace."
+  [_&form _&env pipeline-name & body]
+  (let [[opts stages] (if (map? (first body))
+                        [(first body) (rest body)]
+                        [{} body])]
+    (list `register-pipeline!
+          (list `build-pipeline (list 'quote pipeline-name) opts (vec stages)))))
+
+(def ^:private sandbox-vocab
+  "The pipeline DSL vocabulary exposed (and only this) to sandboxed pipeline
+   files via chengis.dsl.sandbox. Pure data-builders plus the registry writer
+   and the `defpipeline` host-macro — no interop, no IO."
+  {'sh sh 'step step 'stage stage 'parallel parallel
+   'when-branch when-branch 'when-param when-param
+   'always always 'on-success on-success 'on-failure on-failure
+   'post post 'artifacts artifacts 'notify notify 'matrix matrix
+   'build-pipeline build-pipeline 'register-pipeline! register-pipeline!
+   'get-pipeline get-pipeline
+   'defpipeline (with-meta defpipeline-sci-macro {:sci/macro true})})
+
 (defn load-pipeline-file
   "Load and evaluate a pipeline definition file, returning the pipeline map.
-   The file should contain a (defpipeline ...) form.
-   Uses before/after snapshot to safely identify the newly registered pipeline.
+   The file should contain a (defpipeline ...) form. Uses a before/after registry
+   snapshot to identify the newly registered pipeline.
 
-   SECURITY NOTE: Pipeline files are Clojure code and execute with full JVM
-   privileges via `load-file`. This is by design — the same trust model as
-   Jenkins Groovy pipelines or GitHub Actions workflow files. Only trusted
-   pipeline authors should have write access to pipeline definitions. In
-   multi-tenant deployments, pipeline files should be reviewed/approved before
-   execution (see approval gates in chengis.engine.approval)."
-  [path]
-  (let [before (set (keys @pipeline-registry))]
-    (load-file path)
-    (let [after @pipeline-registry
-          new-keys (remove before (keys after))]
-      (when (seq new-keys)
-        (get after (first new-keys))))))
+   SECURITY: pipeline files are Clojure. By default they are evaluated in an SCI
+   SANDBOX (chengis.dsl.sandbox) that exposes only the pipeline DSL vocabulary
+   and safe clojure.core — no Java interop, no eval/load/slurp/spit, with a
+   wall-clock timeout. A pipeline file only builds data describing what to run,
+   so the sandbox changes no legitimate pipeline while removing the
+   arbitrary-code-execution primitive that raw `load-file` carried.
+
+   `opts`:
+     :eval-mode  :sandboxed (default) | :trusted. :trusted falls back to raw
+                 `load-file` (full JVM privileges) — the legacy Jenkins-Groovy /
+                 GitHub-Actions trust model, for operators who knowingly run
+                 full-power pipeline files. Configurable via [:dsl :eval-mode].
+     :timeout-ms sandbox wall-clock budget (default 5000)."
+  ([path] (load-pipeline-file path nil))
+  ([path {:keys [eval-mode timeout-ms] :or {eval-mode :sandboxed timeout-ms 5000}}]
+   (let [before (set (keys @pipeline-registry))]
+     (if (= eval-mode :trusted)
+       (load-file path)
+       (sandbox/eval-pipeline-file path sandbox-vocab :timeout-ms timeout-ms))
+     (let [after @pipeline-registry
+           new-keys (remove before (keys after))]
+       (when (seq new-keys)
+         (get after (first new-keys)))))))
