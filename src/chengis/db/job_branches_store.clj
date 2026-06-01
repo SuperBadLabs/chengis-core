@@ -123,6 +123,22 @@
                               :order-by [[:branch-name :asc]]})
                  {:builder-fn rs/as-unqualified-kebab-maps}))
 
+(defn list-archived-branches
+  "Return only soft-archived branches for `job-id` (`archived_at IS NOT
+   NULL`), ordered by `archived_at` DESC so the most-recently-disappeared
+   branches surface first in the UI. Backs the PR8 'Archived branches'
+   collapsed section on the job-detail multibranch panel."
+  [ds job-id]
+  (jdbc/execute! ds
+                 (sql/format {:select   [:*]
+                              :from     [:job-branches]
+                              :where    [:and
+                                         [:= :job-id job-id]
+                                         [:not= :archived-at nil]]
+                              :order-by [[:archived-at :desc]
+                                         [:branch-name :asc]]})
+                 {:builder-fn rs/as-unqualified-kebab-maps}))
+
 (defn archive-branch!
   "Soft-delete a branch by stamping `archived_at`. The row is preserved so
    PR3's per-branch build numbering can stay monotonic across a
