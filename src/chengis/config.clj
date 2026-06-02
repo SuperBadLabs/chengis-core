@@ -51,6 +51,19 @@
                            :from "chengis@localhost"
                            :default-recipients []}}
    :cleanup {:enabled false :interval-hours 24 :retention-builds 10}
+   ;; Plugin-health auto-quarantine sweep (M3b). When :enabled, a periodic job
+   ;; quarantines external plugins that are stale (the .clj file hasn't changed
+   ;; in > :staleness-days) or match a known-vulnerable advisory, and lifts
+   ;; auto-quarantines that no longer apply (manual quarantines are never
+   ;; touched). :advisories is an inline vector of
+   ;;   {:plugin <name> :id <ident> :reason <text>? :versions [<v> ...]?}
+   ;; (omit :versions to match all versions); :advisories-path reads the same
+   ;; shape from an EDN file. See chengis.engine.plugin-health.
+   :plugin-health {:enabled false
+                   :interval-hours 24
+                   :staleness-days 90
+                   :advisories []
+                   :advisories-path nil}
    :plugins {:directory "plugins" :enabled []
              ;; Plugin provenance (M2a/M3a). :public-keys is a vector of trusted
              ;; Ed25519 signing keys; each entry is either a base64 X.509 SPKI
