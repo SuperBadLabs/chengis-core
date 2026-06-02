@@ -154,7 +154,7 @@
 ;;     → submodule update --init --recursive   (if :submodules?)
 ;;     → lfs install --local + lfs pull        (if :lfs?)
 
-(defn- cone-compatible-pattern?
+(defn cone-compatible-pattern?
   "Cone-mode sparse-checkout patterns must be unambiguous, glob-free
    directory prefixes. We require:
 
