@@ -9,7 +9,7 @@
     (f)
     (registry/reset-registry!)))
 
-(deftest load-builtin-plugins-test
+(deftest ^:product-integration load-builtin-plugins-test
   (testing "load-plugins! registers all builtins"
     (let [summary (loader/load-plugins!)]
       ;; Should have registered plugins
@@ -33,20 +33,20 @@
       (is (some? (registry/get-scm-provider :git))
           "Git SCM provider should be registered"))))
 
-(deftest load-plugins-idempotent-test
+(deftest ^:product-integration load-plugins-idempotent-test
   (testing "loading plugins twice doesn't break anything"
     (loader/load-plugins!)
     (loader/load-plugins!)
     (is (some? (registry/get-step-executor :shell)))))
 
-(deftest load-plugins-with-system-test
+(deftest ^:product-integration load-plugins-with-system-test
   (testing "load-plugins! accepts a system map"
     (let [system {:config {:plugins {:directory "/nonexistent/path"}}}
           summary (loader/load-plugins! system)]
       ;; Should still load builtins even if external dir doesn't exist
       (is (>= (:plugins summary) 5)))))
 
-(deftest registry-summary-after-load-test
+(deftest ^:product-integration registry-summary-after-load-test
   (testing "registry summary reflects loaded plugins"
     (loader/load-plugins!)
     (let [summary (registry/registry-summary)]

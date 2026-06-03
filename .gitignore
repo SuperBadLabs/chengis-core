@@ -1,0 +1,22 @@
+# Leiningen / build artifacts
+target/
+classes/
+checkouts/
+pom.xml
+pom.xml.asc
+*.jar
+*.class
+.lein-*
+.nrepl-port
+.nrepl-history
+
+# Editor / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+# Local state
+*.db
+*.db-shm
+*.db-wal

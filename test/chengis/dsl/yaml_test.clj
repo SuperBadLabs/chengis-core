@@ -268,7 +268,7 @@
 ;; Plugin registration tests
 ;; ---------------------------------------------------------------------------
 
-(deftest yaml-plugin-registration-test
+(deftest ^:product-integration yaml-plugin-registration-test
   (testing "YAML format plugin is registered"
     (is (some? (registry/get-plugin "yaml-format"))))
 

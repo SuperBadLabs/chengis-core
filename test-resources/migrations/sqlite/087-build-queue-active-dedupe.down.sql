@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_build_queue_active_build_id_uniq;

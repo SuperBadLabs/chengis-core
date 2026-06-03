@@ -1,0 +1,96 @@
+;; Capability-tagged migrations manifest — PostgreSQL dialect.
+;;
+;; Each entry below tags a migration with a chengis.product.capability
+;; key. Migrations not listed here are :core (always applied).
+;;
+;; At boot, chengis.db.capability-migrations/filter-migrations restricts
+;; the migration set to (core ∪ migrations-whose-capability-is-enabled).
+;; That way:
+;;   - Anvil-default (SQLite, no opt-ins) gets only the core schema —
+;;     no empty `organizations` / `audit_events` / `saml_identities`
+;;     tables sitting around.
+;;   - Anvil with :enable #{:audit-chain} on a Postgres install gets
+;;     the audit-chain tables applied too.
+;;   - Chengis-default gets everything tagged for its bundle.
+;;
+;; This is the representative subset shipped with Spike 4. The
+;; remaining ~80 migrations stay untagged (treated as :core) until
+;; bulk classification — tracked in
+;; `docs/architecture/spike-4-followup.md`.
+
+{:version 1
+ :default :core
+
+ :tags
+ {;; --- Multi-tenancy ---
+  ;;
+  ;; ALL multi-tenant schema migrations stay :core — foundation
+  ;; (025/026/027) and leaves (056, 078, 082, 086, 090, 092) alike.
+  ;; The `:multi-tenant` capability gates BEHAVIOR (RBAC scoping,
+  ;; isolation enforcement, audit ordering invariants under
+  ;; concurrent writers) — not the schema columns. The org-management
+  ;; UI is gated by the `:org-management-ui` flag, which fires
+  ;; independently of the cap and queries the leaf tables, so the
+  ;; leaves can't be safely demoted. See Codex P2 rounds 3 + 7.
+
+  ;; --- Audit chain (tamper-evident hash-chained audit events) ---
+  ;;
+  ;; The audit table extensions (036 + 097) stay :core because the
+  ;; audit writer is always-on (`:audit :enabled true` by default,
+  ;; `src/chengis/web/server.clj` starts the writer unconditionally,
+  ;; `audit-store/insert-audit!` always references seq_num). The
+  ;; `:audit-chain` capability gates the tamper-evidence GUARANTEE
+  ;; (hash chain enforcement under concurrent writers — PG advisory
+  ;; locks etc.), not the schema substrate. See Codex P2 round 5 on
+  ;; PR #179.
+
+  ;; --- Auth: SAML / LDAP / OIDC / TOTP ---
+  "023-oidc-identities"        :oidc
+  "051-saml-identities"        :saml
+  "052-ldap-identities"        :ldap
+  "055-totp-enrollments"       :totp
+
+  ;; --- Governance: approval gates, OPA, SBOM/provenance ---
+  "021-approvals"              :approval-gates
+  "028-multi-approver"         :approval-gates
+  "030-compliance-reports"     :opa-policies
+  "048-supply-chain-core"      :sbom-provenance
+  "049-opa-licenses"           :opa-policies
+  "050-signatures-regulatory"  :sbom-provenance
+
+  ;; --- Scale: partitioned logs, multi-region agents ---
+  "059-build-log-chunks"       :partitioned-logs
+  "060-pagination-indexes"     :partitioned-logs
+  "061-partition-metadata"     :partitioned-logs
+  "062-agent-region"           :multi-region-agents
+
+  ;; --- Hosted SaaS ---
+  "085-stripe-billing"         :hosted-saas
+
+  ;; --- Cost analytics ---
+  "042-build-cost-entries"     :cost-analytics
+
+  ;; --- Deployments (environments / releases / health / promotions) ---
+  "063-environments"           :deployments
+  "064-releases"               :deployments
+  "065-artifact-promotions"    :deployments
+  "066-deployment-strategies"  :deployments
+  "067-deployments"            :deployments
+  "068-health-checks"          :deployments
+  "069-deploy-dashboard-indexes" :deployments
+
+  ;; --- Infrastructure-as-Code ---
+  "070-iac-projects"           :iac
+  "071-iac-states"             :iac
+  "072-iac-cost-estimates"     :iac
+  "073-iac-dashboard-indexes"  :iac
+
+  ;; --- Secret rotation (versioned secrets + rotation policies) ---
+  "057-secret-rotation-policies" :secret-rotation
+  "058-secret-versions"          :secret-rotation
+
+  ;; Migrations 011-020, 029, 031-035, 037-041, 043-047, 053-054,
+  ;; 074-077, 079-081, 083-084, 087-089, 091, 093-096, 098-104 still
+  ;; live as :core — see docs/architecture/spike-4-followup.md for the
+  ;; remaining classification queue.
+  }}

@@ -1,0 +1,11 @@
+DROP INDEX IF EXISTS idx_coverage_files_coverage_id;
+--;;
+DROP TABLE IF EXISTS coverage_files;
+--;;
+DROP INDEX IF EXISTS idx_coverage_results_org_created;
+--;;
+DROP INDEX IF EXISTS idx_coverage_results_job_org;
+--;;
+DROP INDEX IF EXISTS idx_coverage_results_build_id;
+--;;
+DROP TABLE IF EXISTS coverage_results;

@@ -1,13 +1,13 @@
-(defproject chengis/chengis-core "1.0.0-SNAPSHOT"
+(defproject superbadlabs/chengis-core "0.1.0"
   :description
-  "chengis-core — the engine library underlying Chengis (the existing CI
-   platform) and anvil (the OSS Jenkins-replacement product).
+  "chengis-core — the composable Clojure CI/CD engine library underlying
+   anvil (OSS, single-tenant) and Chengis (commercial, multi-tenant).
 
-   This library contains the parts that are not product-specific:
+   Contains the parts that are not product-specific:
      - Pipeline IR types and orchestration primitives
      - StepDispatcher protocol (the only API contract between core and products)
      - Agent protocol and worker
-     - Plugin protocol and registry
+     - Plugin protocol and SCI-sandboxed registry
      - Observability plumbing (metrics, logging)
      - Storage primitives (DB connection, migration runner, generic store helpers)
      - Feature-flag resolution
@@ -15,11 +15,14 @@
 
    Anything UI-shaped, schema-specific (billing, MFA, branding), or
    product-cli-shaped lives in the consuming products, NOT here.
+   Production migrations are owned by the consuming product; chengis-core
+   ships only the migration RUNNER, not migration files.
 
-   Library extraction in progress; see
-   `docs/jenkins-compat/library-extraction-strategy.md`."
+   Extracted from the chengis monorepo on 2026-06-03 via
+   `git subtree split --prefix=chengis-core`. See CHANGELOG.md and
+   README.md for consumption + provenance details."
 
-  :url "https://chengis.io"
+  :url "https://github.com/SuperBadLabs/chengis-core"
   :license {:name "Apache-2.0"
             :url "https://www.apache.org/licenses/LICENSE-2.0"}
 
@@ -64,9 +67,27 @@
   :resource-paths ["resources"]
   :target-path "target/%s"
 
+  ;; ^:product-integration tests assert behavior that depends on
+  ;; PRODUCT-side plugin implementations (chengis.plugin.builtin.*)
+  ;; which live in the consuming product, NOT in chengis-core itself.
+  ;; They fail when chengis-core is tested standalone. Default `lein test`
+  ;; excludes them; products can run them with their own classpath via
+  ;; `lein test :product-integration` or `lein test :all`.
+  :test-selectors {:default (complement :product-integration)
+                   :product-integration :product-integration
+                   :all (constantly true)}
+
   ;; Strict warnings — core is small and must stay clean.
   :global-vars {*warn-on-reflection* true}
 
   :profiles {:dev {:dependencies [[org.clojure/test.check "1.1.3"]
                                   ;; SQLite is the trial / unit-test driver
-                                  [org.xerial/sqlite-jdbc "3.51.2.0"]]}})
+                                  [org.xerial/sqlite-jdbc "3.51.2.0"]]
+                   ;; test-resources/ holds the SQLite migration files that
+                   ;; chengis-core's OWN tests need. Production consumers
+                   ;; (anvil, Chengis) supply their own migration directory
+                   ;; under their resources/ — chengis-core ships only the
+                   ;; runner, never production migration files. These
+                   ;; test-resources are dev-only and NOT bundled into the
+                   ;; installed/published artifact.
+                   :resource-paths ["test-resources"]}})
