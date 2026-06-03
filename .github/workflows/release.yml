@@ -1,0 +1,59 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Clojure + Leiningen
+        uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          lein: latest
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-m2-${{ hashFiles('project.clj') }}
+          restore-keys: ${{ runner.os }}-m2-
+
+      - name: Verify version matches tag
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PROJ_VERSION=$(head -1 project.clj | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "$TAG" != "$PROJ_VERSION" ]; then
+            echo "::error::Tag $TAG does not match project.clj version $PROJ_VERSION"
+            exit 1
+          fi
+
+      - name: Build library jar
+        run: lein jar
+
+      - name: Build pom.xml
+        run: lein pom
+
+      - name: Create GitHub release with artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          gh release create "$TAG" \
+            target/*.jar \
+            pom.xml \
+            --title "chengis-core $TAG" \
+            --generate-notes \
+            --verify-tag
