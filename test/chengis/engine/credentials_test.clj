@@ -17,9 +17,11 @@
    contract."
   (:require [chengis.engine.credentials :as cred]
             [chengis.engine.result :as result]
+            [clojure.data.json :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [clojure.test :refer [deftest is testing use-fixtures]]))
+            [clojure.test :refer [deftest is testing use-fixtures]]
+            [clojure.xml]))
 
 (defn- ^java.io.File tmp-dir [prefix]
   (let [d (io/file (System/getProperty "java.io.tmpdir")
@@ -159,6 +161,101 @@
         ((:cleanup-fn r)))
       (finally (rm-r! dir)))))
 
+(deftest file-binding-rejects-path-traversal-in-file-name
+  ;; Headline: a malicious record :file-name like "../../etc/passwd"
+  ;; must NOT escape the per-build-dir sandbox. We expect the basename
+  ;; to be taken, leaving the file inside the sandbox.
+  (let [store (cred/map-store
+               {"X" {:id "X" :type :file
+                     :file-name "../../etc/escape.txt"
+                     :file-content "shh"}})
+        dir (tmp-dir "cred")]
+    (try
+      (let [r (cred/bind! store (.getAbsolutePath dir)
+                          [{:type :file :credential-id "X" :var "F"}])
+            path (get-in r [:env "F"])]
+        (is (= :ok (:result r)))
+        (is (str/starts-with? path (.getAbsolutePath dir))
+            "materialized file must stay inside per-build-dir")
+        (is (str/ends-with? path "escape.txt")
+            "basename is preserved, prefix sandboxed")
+        ((:cleanup-fn r)))
+      (finally (rm-r! dir)))))
+
+(deftest file-binding-defaults-name-when-blank-or-bare-dotsegments
+  (let [store (cred/map-store
+               {"X" {:id "X" :type :file
+                     :file-name ".."          ;; reduces to no basename
+                     :file-content "shh"}})
+        dir (tmp-dir "cred")]
+    (try
+      (let [r (cred/bind! store (.getAbsolutePath dir)
+                          [{:type :file :credential-id "X" :var "F"}])
+            path (get-in r [:env "F"])]
+        (is (= :ok (:result r)))
+        (is (str/ends-with? path "credential.bin")
+            "blank basename falls back to the safe default name")
+        ((:cleanup-fn r)))
+      (finally (rm-r! dir)))))
+
+;; ---------------------------------------------------------------------------
+;; :certificate
+;; ---------------------------------------------------------------------------
+
+(deftest certificate-binding-renders-string-keystore
+  (let [store (cred/map-store
+               {"CERT" {:id "CERT" :type :certificate
+                        :keystore "fake-keystore-bytes-as-string"
+                        :passphrase "k3y"}})
+        dir (tmp-dir "cred")]
+    (try
+      (let [r (cred/bind! store (.getAbsolutePath dir)
+                          [{:type :certificate
+                            :credential-id "CERT"
+                            :keystore-file-var "KS"
+                            :passphrase-var "KS_PASS"}])
+            path (get-in r [:env "KS"])]
+        (is (= :ok (:result r)))
+        (is (.exists (io/file path)))
+        (is (str/ends-with? path "credential.keystore"))
+        (is (= "k3y" (get-in r [:env "KS_PASS"])))
+        (is (some #{"k3y"} (:mask-values r)))
+        ((:cleanup-fn r)))
+      (finally (rm-r! dir)))))
+
+(deftest certificate-binding-renders-bytes-keystore
+  (let [bs (.getBytes "fake-keystore" "UTF-8")
+        store (cred/map-store
+               {"CERT" {:id "CERT" :type :certificate :keystore bs}})
+        dir (tmp-dir "cred")]
+    (try
+      (let [r (cred/bind! store (.getAbsolutePath dir)
+                          [{:type :certificate
+                            :credential-id "CERT"
+                            :keystore-file-var "KS"}])
+            path (get-in r [:env "KS"])]
+        (is (= :ok (:result r)))
+        (is (.exists (io/file path))))
+      (finally (rm-r! dir)))))
+
+(deftest certificate-binding-with-unsupported-keystore-type-fails-without-throwing
+  ;; A misbehaving record provides a non-string non-bytes :keystore (e.g.
+  ;; a ByteBuffer or a map). bind! MUST NOT throw — it must return
+  ;; :credential-render-failed so callers get a structured response.
+  (let [store (cred/map-store
+               {"CERT" {:id "CERT" :type :certificate
+                        :keystore {:not-supported true}}})
+        dir (tmp-dir "cred")]
+    (try
+      (let [r (cred/bind! store (.getAbsolutePath dir)
+                          [{:type :certificate
+                            :credential-id "CERT"
+                            :keystore-file-var "KS"}])]
+        (is (= :failed (:result r))
+            "bind! must remain non-throwing for malformed records")
+        (is (= :credential-render-failed (:rule r))))
+      (finally (rm-r! dir)))))
+
 ;; ---------------------------------------------------------------------------
 ;; Unresolved
 ;; ---------------------------------------------------------------------------
@@ -181,11 +278,19 @@
     (is (= :credential-store-missing (:rule r)))
     (is (= ["X"] (:unresolved r)))))
 
-(deftest blank-per-build-dir-fails
+(deftest blank-per-build-dir-fails-and-surfaces-unresolved
+  ;; Headline: when per-build-dir is missing, bind! must STILL surface
+  ;; :unresolved with every credential id, so a downstream EX2
+  ;; classifier that only consumes (:unresolved r) still classifies
+  ;; the build as :failure rather than silently neutral/success.
   (let [store (cred/map-store {"X" {:id "X" :type :secret-text :value "v"}})]
     (let [r (cred/bind! store ""
-                        [{:type :string :credential-id "X" :var "T"}])]
-      (is (= :failed (:result r))))))
+                        [{:type :string :credential-id "X" :var "T"}
+                         {:type :string :credential-id "Y" :var "T2"}])]
+      (is (= :failed (:result r)))
+      (is (= :credential-per-build-dir-missing (:rule r)))
+      (is (= ["X" "Y"] (:unresolved r))
+          "every requested credential id surfaces as :unresolved"))))
 
 (deftest empty-bindings-list-is-ok-noop
   (let [store (cred/map-store {})
@@ -285,6 +390,43 @@
                                          {:server-id "" :username "a"
                                           :password "p" :per-build-home "/h"}))
       "template returns nil on missing required field, not bogus content"))
+
+(deftest maven-settings-escapes-xml-special-characters
+  (testing "passwords / server-ids with &, <, >, \" produce valid XML"
+    (let [r (cred/render-config-template
+             :maven-settings
+             {:server-id "id & < > \""
+              :username "<u>"
+              :password "p&p"
+              :per-build-home "/h"})
+          content (:content r)]
+      (is (str/includes? content "&amp;"))
+      (is (str/includes? content "&lt;"))
+      (is (str/includes? content "&gt;"))
+      (is (str/includes? content "&quot;"))
+      ;; And the literal special chars do NOT leak through the
+      ;; escaped fields (we still allow them inside attribute-name
+      ;; literals like the xmlns URL — re-find against the userinfo)
+      (is (not (str/includes? content "<u>")))
+      (is (not (str/includes? content "p&p")))
+      ;; Confirm parseable XML (will throw on bad input)
+      (is (some? (clojure.xml/parse
+                  (java.io.ByteArrayInputStream.
+                   (.getBytes content "UTF-8"))))))))
+
+(deftest docker-config-escapes-json-special-characters
+  (testing "registry / auth values with \" and \\ produce valid JSON"
+    (let [r (cred/render-config-template
+             :docker-config
+             {:registry "ghcr.io/with\"quote\\back"
+              :auth-base64 "AAA\"BBB"
+              :per-build-home "/h"})
+          content (:content r)
+          parsed (json/read-str content)]
+      (is (some? parsed))
+      (is (= "AAA\"BBB"
+             (get-in parsed ["auths" "ghcr.io/with\"quote\\back" "auth"]))
+          "round-trips correctly through JSON parse"))))
 
 (deftest defaults-are-registered
   (let [ids (set (cred/registered-config-templates))]

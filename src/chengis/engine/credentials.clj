@@ -24,12 +24,17 @@
      - the rendering rules (text → env, username-password → 2 envs,
        file → materialized file + ENV pointing at it, ssh-key → file,
        cert → file + passphrase env)
-     - per-build config-file injection (~/.m2/settings.xml, ~/.npmrc,
-       ~/.pip/pip.conf, ~/.docker/config.json)
+     - per-build config-file injection: three default templates ship
+       (~/.m2/settings.xml, ~/.npmrc, ~/.docker/config.json); pip's
+       ~/.pip/pip.conf and other shapes can be added via
+       `register-config-template!` in the consuming product
      - `bind!` — top-level: resolve refs against a store, render, emit
      - `with-bindings!` — bracket helper that materializes files, runs
-       a body, then guarantees cleanup of files + JVM-resident secret
-       material
+       a body, then guarantees cleanup of the materialized files
+       (note: in-process JVM string interning is out of scope — secret
+       values exist on the JVM heap for the build's lifetime; operators
+       who need stronger memory hygiene should pair this with a JVM
+       restart between builds or a sealed-secrets backend)
 
    The store contract
    ==================
@@ -83,9 +88,23 @@
    `:credential-unresolved` → `:failure`. No silent successes.
 
    Refs: docs/v0.2-board.md CC2-EX4."
-  (:require [clojure.java.io :as io]
+  (:require [clojure.data.json :as json]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [taoensso.timbre :as log]))
+
+(defn- xml-escape
+  "Escape a string for safe interpolation into an XML element body or
+   attribute value. Handles `&`, `<`, `>`, `\"`, and `'`. Returns the
+   empty string for nil input so callers can render-with-replace
+   without npe."
+  [s]
+  (-> (str s)
+      (str/replace "&"  "&amp;")
+      (str/replace "<"  "&lt;")
+      (str/replace ">"  "&gt;")
+      (str/replace "\"" "&quot;")
+      (str/replace "'"  "&apos;")))
 
 ;; ---------------------------------------------------------------------------
 ;; Store protocol
@@ -128,6 +147,22 @@
 
 (defn- file-mode-600 [] 0600)
 
+(defn- safe-basename
+  "Reduce an attacker-controlled `file-name` to a basename within the
+   per-build dir, defeating `..` segments and absolute paths. Returns
+   nil for blank input, `.`, `..`, or names that contain a path
+   separator after `.getName` resolved them out — caller falls back to
+   a default."
+  [^String file-name]
+  (when (non-blank? file-name)
+    (let [f (io/file file-name)
+          base (.getName f)]
+      (when (and (non-blank? base)
+                 (not (#{"." ".."} base))
+                 (not (str/includes? base "/"))
+                 (not (str/includes? base "\\")))
+        base))))
+
 (defmulti render-binding
   "Multimethod dispatch on (:type binding)."
   (fn [binding _record _per-build-dir] (:type binding)))
@@ -161,7 +196,10 @@
   (when (and (= :file type)
              (non-blank? var)
              (or (string? file-content) (bytes? file-content)))
-    (let [name (or (when (non-blank? file-name) file-name) "credential.bin")
+    ;; file-name comes from the credential record which can carry
+    ;; operator-set values. Reduce it to a basename so values like
+    ;; `../etc/passwd` cannot escape the per-build-dir sandbox.
+    (let [name (or (safe-basename file-name) "credential.bin")
           path (str per-build-dir java.io.File/separatorChar name)
           masks (cond-> []
                   (string? file-content) (conj file-content))]
@@ -191,9 +229,15 @@
   [{:keys [keystore-file-var passphrase-var]}
    {:keys [type keystore passphrase]}
    per-build-dir]
+  ;; `write-file!` only handles string + bytes content, so we MUST
+  ;; pre-validate that the record's :keystore is one of those — otherwise
+  ;; `bind!` throws instead of returning {:result :failed ...}, breaking
+  ;; its non-throwing contract. Any other type → render nil → handled
+  ;; upstream as :credential-render-failed.
   (when (and (= :certificate type)
              (non-blank? keystore-file-var)
-             (some? keystore))
+             (or (bytes? keystore)
+                 (non-blank? keystore)))
     (let [path (str per-build-dir java.io.File/separatorChar "credential.keystore")
           env (cond-> {keystore-file-var path}
                 (and (non-blank? passphrase-var)
@@ -295,9 +339,15 @@
      :unresolved (mapv :credential-id bindings)}
 
     (or (nil? per-build-dir) (str/blank? per-build-dir))
+    ;; per-build-dir missing is an environment/config bug, but the
+    ;; build still cannot resolve its credentials — emit a distinct
+    ;; rule AND surface :unresolved with every requested id so callers
+    ;; that only feed (:unresolved r) into EX2 still classify the
+    ;; build as :failure. No silent successes.
     {:result :failed
      :explain "per-build-dir is required"
-     :rule :credential-store-missing}
+     :rule :credential-per-build-dir-missing
+     :unresolved (mapv :credential-id bindings)}
 
     (empty? bindings)
     {:result :ok :env {} :files [] :mask-values [] :cleanup-fn (constantly nil)}
@@ -398,9 +448,9 @@
                        "<settings xmlns=\"http://maven.apache.org/SETTINGS/1.0.0\">\n"
                        "  <servers>\n"
                        "    <server>\n"
-                       "      <id>" server-id "</id>\n"
-                       "      <username>" username "</username>\n"
-                       "      <password>" password "</password>\n"
+                       "      <id>" (xml-escape server-id) "</id>\n"
+                       "      <username>" (xml-escape username) "</username>\n"
+                       "      <password>" (xml-escape password) "</password>\n"
                        "    </server>\n"
                        "  </servers>\n"
                        "</settings>\n")]
@@ -437,13 +487,14 @@
   (when (and (non-blank? registry)
              (non-blank? auth-base64)
              (non-blank? per-build-home))
-    (let [content (str "{\n"
-                       "  \"auths\": {\n"
-                       "    \"" registry "\": {\n"
-                       "      \"auth\": \"" auth-base64 "\"\n"
-                       "    }\n"
-                       "  }\n"
-                       "}\n")]
+    ;; Render via clojure.data.json so registries / auth blobs that
+    ;; contain `"` or `\` produce valid JSON instead of subtle
+    ;; auth-failures from a broken config.json. data.json is already on
+    ;; the classpath via project.clj.
+    (let [content (str (json/write-str
+                        {:auths {registry {:auth auth-base64}}}
+                        :escape-slash false)
+                       "\n")]
       {:path (str per-build-home java.io.File/separatorChar
                   ".docker" java.io.File/separatorChar "config.json")
        :mode (file-mode-600)
