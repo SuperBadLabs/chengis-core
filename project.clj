@@ -73,8 +73,13 @@
   ;; They fail when chengis-core is tested standalone. Default `lein test`
   ;; excludes them; products can run them with their own classpath via
   ;; `lein test :product-integration` or `lein test :all`.
+  ;; ^:docker tests exercise the chengis.engine.backend.docker backend
+  ;; against a real docker daemon. They self-skip (emit a single log line)
+  ;; when no daemon is reachable, so they're included in :default; the
+  ;; :docker selector exists for the operator-targeted form `lein test :docker`.
   :test-selectors {:default (complement :product-integration)
                    :product-integration :product-integration
+                   :docker :docker
                    :all (constantly true)}
 
   ;; Strict warnings — core is small and must stay clean.
