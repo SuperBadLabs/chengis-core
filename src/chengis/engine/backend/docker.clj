@@ -138,10 +138,11 @@
 ;; Operators can override per-config:
 ;;   :user            — explicit string passed to `--user` (e.g. "1000:1000",
 ;;                       "root", or "myuser")
-;;   :host-user?      — when true (default for v0.3+), auto-detect current
-;;                       host uid:gid via `id -u` / `id -g` and pass them.
-;;                       When false, no `--user` flag is added (container
-;;                       runs as its image-default user, usually root).
+;;   :host-user?      — default true (introduced in 0.2.1). Auto-detect
+;;                       current host uid:gid via `id -u` / `id -g` and
+;;                       pass `--user N:M`. When false, no `--user` flag
+;;                       is added (container runs as its image-default
+;;                       user, usually root).
 ;;
 ;; Some images require root for `apk add` / `apt-get install` style
 ;; setup. Operators using those should set `:host-user? false` for the
@@ -172,16 +173,23 @@
 
 (defn- user-flags
   "Return `[\"--user\" \"<uid>:<gid>\"]` or `[\"--user\" <explicit>]` per
-   config. When neither :user nor (true) :host-user? applies, return [].
-   The image's default user runs the container (typically root)."
+   config. ALWAYS returns a vector — empty if neither :user nor
+   (true) :host-user? applies (or if host-uid:gid detection failed on
+   this platform). Never returns nil; that contract matters because
+   the call site `(concat ... (user-flags ...) ...)` would silently
+   produce a malformed docker argv if nil leaked through."
   [{:keys [user host-user?] :or {host-user? true}}]
   (cond
     (string? user)
     ["--user" user]
 
     host-user?
-    (when-let [[u g] @host-uid-gid]
-      ["--user" (str u ":" g)])
+    (if-let [[u g] @host-uid-gid]
+      ["--user" (str u ":" g)]
+      ;; Detection failed on this platform — return [] so the docker
+      ;; argv stays well-formed and the container falls back to its
+      ;; image-default user (usually root). PR #9 Copilot review item.
+      [])
 
     :else
     []))
