@@ -247,3 +247,66 @@
          (finally
            (backend/cleanup b {:job-name "rl" :build-number 1})
            (.delete (io/file ws))))))))
+
+;; ---------------------------------------------------------------------------
+;; CC2-EX1c — --user $(id -u):$(id -g) so container writes land on host as
+;; the calling user, not root. Without this, mvn-package-inside-container
+;; writes target/*.jar as root:root on the host, and anvil (running as the
+;; calling user) can't read or copy them for archiveArtifacts.
+;; ---------------------------------------------------------------------------
+
+(deftest user-flags-explicit-string-takes-precedence
+  (testing "explicit :user 'X' overrides :host-user? default detection"
+    (is (= ["--user" "1234:5678"]
+           (#'docker/user-flags {:user "1234:5678"})))
+    (is (= ["--user" "root"]
+           (#'docker/user-flags {:user "root" :host-user? true})))))
+
+(deftest user-flags-host-user-false-emits-nothing
+  (testing ":host-user? false → no --user flag (container runs as image default)"
+    (is (= [] (#'docker/user-flags {:host-user? false})))
+    (is (= [] (#'docker/user-flags {:host-user? false :user nil})))))
+
+(deftest user-flags-default-detects-host-uid-gid
+  (testing "no explicit config → default :host-user? true → tries to detect uid:gid"
+    (let [r (#'docker/user-flags {})]
+      ;; On linux + most macOS hosts, `id -u` and `id -g` work and return digits.
+      ;; On sandboxed environments without `id`, the helper returns nil and
+      ;; user-flags returns [].
+      (is (or (= r [])
+              (and (= "--user" (first r))
+                   (re-matches #"\d+:\d+" (second r))))
+          (str "expected either [] (no `id` on host) or [\"--user\" \"N:M\"], got "
+               (pr-str r))))))
+
+(deftest ^:docker user-flag-actually-changes-file-ownership-inside-container
+  (when (docker/docker-available?)
+    (testing "with --user $(id -u):$(id -g), files written by container are owned by host user"
+      ;; Run two builds: one with :host-user? true (default), one with false.
+      ;; The first should write files owned by the calling uid:gid;
+      ;; the second should write files owned by the container's default user (root).
+      (let [ws (tmp-workspace)
+            ;; Use a backend that auto-detects host uid:gid
+            b1 (docker/docker-backend
+                 {:image "alpine:3.20" :mode :per-step :host-user? true})
+            r1 (backend/prepare-workspace b1 {:workspace-path ws
+                                              :job-name "u" :build-number 1})
+            _ (is (= :ok (:result r1)))
+            ;; Step writes a file and runs `stat -c '%u:%g' /workspace/host-user-marker`
+            exec-r (backend/execute-step
+                     b1 {:command "touch host-user-marker && stat -c %u:%g host-user-marker"
+                         :dir ws
+                         :env {}
+                         :backend-state (:backend-state r1)})
+            stdout-uid-gid (str/trim (or (:stdout exec-r) ""))
+            current-uid-gid (when-let [[u g] @@#'docker/host-uid-gid]
+                              (str u ":" g))]
+        (try
+          (when current-uid-gid
+            (is (= current-uid-gid stdout-uid-gid)
+                (str "file inside container should be owned by host's uid:gid "
+                     current-uid-gid ", got " stdout-uid-gid)))
+          (finally
+            (backend/cleanup b1 {:job-name "u" :build-number 1})
+            (.delete (io/file ws "host-user-marker"))
+            (.delete (io/file ws))))))))

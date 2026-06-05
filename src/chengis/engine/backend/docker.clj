@@ -126,6 +126,66 @@
 (defn- workspace-bind [workspace-path]
   ["-v" (str workspace-path ":" workspace-path)])
 
+;; ---------------------------------------------------------------------------
+;; User flags — pass --user $(id -u):$(id -g) so files written inside the
+;; container land on the host owned by the calling user, not by root.
+;;
+;; Without this, an `mvn package` inside `maven:3.9-eclipse-temurin-21`
+;; writes `target/*.jar` as root:root on the host (because the container's
+;; default user is root). The host process (anvil, running as
+;; e.g. `srikanth`) then can't read or copy those files for archiveArtifacts.
+;;
+;; Operators can override per-config:
+;;   :user            — explicit string passed to `--user` (e.g. "1000:1000",
+;;                       "root", or "myuser")
+;;   :host-user?      — when true (default for v0.3+), auto-detect current
+;;                       host uid:gid via `id -u` / `id -g` and pass them.
+;;                       When false, no `--user` flag is added (container
+;;                       runs as its image-default user, usually root).
+;;
+;; Some images require root for `apk add` / `apt-get install` style
+;; setup. Operators using those should set `:host-user? false` for the
+;; affected agent label / job.
+;; ---------------------------------------------------------------------------
+
+(defn- detect-host-uid-gid
+  "Run `id -u` and `id -g` and return `[uid gid]` as strings, or nil
+   on platforms where either invocation fails (Windows, sandboxed CI
+   without `id`, etc.). Cached for the lifetime of the JVM — calling
+   `id` per step is cheap but doing it once is cheaper."
+  []
+  (try
+    (let [run (fn [cmd]
+                (let [pb (ProcessBuilder. ^java.util.List cmd)
+                      _ (.redirectErrorStream pb true)
+                      proc (.start pb)
+                      out (slurp (.getInputStream proc))]
+                  (.waitFor proc)
+                  (str/trim out)))
+          u (run ["id" "-u"])
+          g (run ["id" "-g"])]
+      (when (and (re-matches #"\d+" u) (re-matches #"\d+" g))
+        [u g]))
+    (catch Throwable _ nil)))
+
+(def ^:private host-uid-gid (delay (detect-host-uid-gid)))
+
+(defn- user-flags
+  "Return `[\"--user\" \"<uid>:<gid>\"]` or `[\"--user\" <explicit>]` per
+   config. When neither :user nor (true) :host-user? applies, return [].
+   The image's default user runs the container (typically root)."
+  [{:keys [user host-user?] :or {host-user? true}}]
+  (cond
+    (string? user)
+    ["--user" user]
+
+    host-user?
+    (when-let [[u g] @host-uid-gid]
+      ["--user" (str u ":" g)])
+
+    :else
+    []))
+
 (defn- container-name
   "Deterministic per-build container name. Lowercased, sanitized to the
    subset docker accepts. Includes job + build + a salt fragment so retries
@@ -181,12 +241,14 @@
    steps. The container runs `tail -f /dev/null` so it survives between
    `docker exec`s. Returns {:container-id STRING, :result :ok|:failed,
    :explain?}."
-  [{:keys [image network-mode resource-limits]}
+  [{:keys [image network-mode resource-limits user host-user?]
+    :or {host-user? true}}
    {:keys [workspace-path env] :as build-spec}]
   (let [name (container-name build-spec (short-salt))
         args (vec (concat ["run" "-d"
                            "--name" name
                            "-w" workspace-path]
+                          (user-flags {:user user :host-user? host-user?})
                           (workspace-bind workspace-path)
                           (env-flags env)
                           (network-flags network-mode)
@@ -231,7 +293,9 @@
 (defn- run-disposable-container
   "Single-shot `docker run --rm` for a step. Used in :per-step mode and as
    the fallback when there is no prepared build container."
-  [{:keys [image network-mode resource-limits]}
+  [{:keys [image network-mode resource-limits user host-user?]
+    :or {host-user? true}
+    :as config}
    workspace-path
    {:keys [command dir env timeout mask-values]}]
   (let [logged-command (cond-> command
@@ -241,6 +305,7 @@
         start (System/currentTimeMillis)
         args (vec (concat ["run" "--rm"
                            "-w" (or dir workspace-path)]
+                          (user-flags {:user user :host-user? host-user?})
                           (workspace-bind workspace-path)
                           (env-flags env)
                           (network-flags network-mode)
@@ -401,6 +466,17 @@
      :network-mode STRING           — passed through as --network
      :resource-limits MAP           — see ns docstring
      :cancel-grace-ms LONG          — grace before SIGKILL (default 10000)
+     :host-user? BOOL               — default true. When true (default),
+                                       container runs as the host's
+                                       current uid:gid so files written
+                                       inside the container land on the
+                                       host owned by the calling user
+                                       instead of root. Set false for
+                                       images that need root for setup
+                                       (apk add, apt-get install).
+     :user STRING                   — explicit `--user` value. Overrides
+                                       :host-user? when present. Examples:
+                                       \"1000:1000\", \"root\", \"myuser\".
 
    Constructing the backend does NOT pull the image or start a container
    — that happens at `prepare-workspace`. Constructing it also does NOT
