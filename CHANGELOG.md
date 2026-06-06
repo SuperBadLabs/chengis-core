@@ -6,6 +6,34 @@ versioning follows [Semantic Versioning](https://semver.org/) but with
 the pre-1.0 disclaimer: **API may break across minor releases until
 `1.0.0`**.
 
+## [0.2.1] — 2026-06-05
+
+**Theme:** the file-ownership fix. 0.2.0 made Docker execution work; 0.2.1
+makes the artifacts it produces actually readable on the host. Caught by
+anvil's wild-corpus dirty-dozen hunt: containers ran as root, archived
+1,040 jars to a bind-mounted workspace, and the host couldn't read its
+own files. One-line conceptual fix, real downstream impact.
+
+### Changed
+
+- **`chengis.engine.backend.docker`** — Both `run-disposable-container`
+  and `start-build-container!` now default to passing
+  `--user $(id -u):$(id -g)` so writes inside the container land owned
+  by the invoking host user, not root. Detection uses `id -u` / `id -g`
+  via `process/sh`, cached in a `delay` so it runs at most once per JVM.
+  Returns `[]` (not nil) on detection failure so the caller can
+  unconditionally `concat` the result into the docker args. Operators
+  who explicitly want root-mode can pass `:host-user? false` per call;
+  default is `true` so the path that surfaced this problem in
+  wild-corpus stays fixed by default. (#9 CC2-EX1c)
+
+### Verified against
+
+- anvil wild-corpus dirty-dozen hunt: apache-camel-quarkus produced
+  1,040 real jar files (196 MB) into a host-readable bind-mount in
+  841 seconds. First measurable wild-corpus build with non-zero
+  real-artifact count.
+
 ## [0.2.0] — 2026-06-05
 
 **Theme:** the execution layer. 0.1.0 shipped the protocol scaffolding;
