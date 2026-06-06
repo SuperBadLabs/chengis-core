@@ -1,4 +1,4 @@
-(defproject superbadlabs/chengis-core "0.2.1"
+(defproject superbadlabs/chengis-core "0.3.0"
   :description
   "chengis-core — the composable Clojure CI/CD engine library underlying
    anvil (OSS, single-tenant) and Chengis (commercial, multi-tenant).

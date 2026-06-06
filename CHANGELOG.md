@@ -6,6 +6,94 @@ versioning follows [Semantic Versioning](https://semver.org/) but with
 the pre-1.0 disclaimer: **API may break across minor releases until
 `1.0.0`**.
 
+## [0.3.0] — 2026-06-06
+
+**Theme:** the tool-installer matrix. 0.2.x shipped the execution layer +
+the file-ownership fix that made it useful at scale. 0.3.0 ships the
+real concrete installers — the second piece anvil needed to stop
+returning empty `tool('jdk_17_latest')` and start resolving to a real
+JDK on disk.
+
+Four installers, ~2,200 LOC of new public surface across two PRs,
+zero new transitive deps on the classpath.
+
+### Added
+
+- **`chengis.tools.http`** — Single-seam HTTP client (fetch-bytes,
+  fetch-json, download-to-file). Manual redirect chase (http-kit's
+  auto-follow drops bodies on some redirect chains), 5xx + transport
+  retry with linear backoff, `*.partial` + atomic rename so a
+  half-downloaded tarball never poisons the cache. Tests `with-redefs`
+  on this ns to keep installer tests hermetic. (#11 CC2-EX3b.1)
+- **`chengis.tools.archive`** — tar.gz + zip extraction via native
+  `tar` / `unzip`. Layered traversal defense: pre-validate every
+  entry against `..`, absolute path, and Windows-style separators;
+  post-extract canonical-prefix? walk on every dirent. `:strip-components N`
+  knob mirrors tar's flag. Zero new dep — uses the omnipresent system
+  tools rather than commons-compress. (#11)
+- **`chengis.tools.checksum`** — Streaming SHA-256 / SHA-512
+  (64KB buffer). `verify!` refuses to accept a blank expected digest
+  (no-silent-success contract); throws `:checksum/mismatch` on miss
+  with both digests in the ex-data. (#11)
+- **`chengis.tools.platform`** — OS + arch detection through
+  `tools/getprop*` so tests can pin without monkeypatching JVM
+  globals. Maps amd64/x86_64 → `:x64`, aarch64/arm64 → `:aarch64`;
+  linux/mac × x64/aarch64 supported. (#11)
+- **`chengis.tools.temurin`** — Eclipse Temurin JDK installer.
+  Queries `api.adoptium.net/v3/assets/feature_releases/{major}/ga`,
+  picks the latest GA for the host platform, downloads via
+  `http/download-to-file`, verifies SHA-256 from the API payload
+  inline, extracts with `--strip-components 1`. Supports Jenkins-style
+  `jdk_17_latest` and modern `jdk:17.0.1+12` descriptors. Linux/macOS
+  × x64/aarch64; Windows surfaces `:result :unsupported`. (#11)
+- **`chengis.tools.maven`** — Apache Maven installer via
+  `dlcdn.apache.org/maven/maven-3/`. Explicit X.Y.Z versions
+  (`_latest` deferred; Apache has no JSON API). SHA-512 sibling file
+  for digest. (#12 CC2-EX3b.2)
+- **`chengis.tools.gradle`** — Gradle installer via
+  `services.gradle.org`. Both explicit and `_latest` via the official
+  current-versions JSON. zip distribution with explicit
+  walk+flatten (archive's `:strip-components` isn't implemented for
+  zip). SHA-256 sibling file. (#12)
+- **`chengis.tools.node`** — Node.js installer via `nodejs.org/dist`.
+  Both explicit (`node:20.10.0`) and `_latest` via the dist/index.json.
+  tar.gz over tar.xz to avoid an xz dep. `parse-shasums-for` matches
+  by filename in the aggregate SHASUMS256.txt — never accepts another
+  file's digest. (#12)
+
+### Verified against
+
+- Anvil's `tool('jdk_X_latest')` step routes through
+  `chengis.tools/resolve!` (anvil AN4-3). After 0.3.0 lands, operators
+  register `(temurin/temurin-installer)` at startup and the resolve
+  call returns a real on-disk path with `bin/java` executable.
+- 24 new tests / 60 new assertions across the new namespaces. Full
+  chengis-core suite remains green: 1,013 tests / 3,625 assertions,
+  0 failures.
+
+### Compatibility notes
+
+- Consumers depending only on `chengis.engine.*`, `chengis.tools` (the
+  protocol ns), or `chengis.dsl.*` are **unaffected** — this release
+  only adds new public namespaces under `chengis.tools.*`.
+- A consuming product (e.g. anvil) wanting to expose all four
+  installers should register them at startup:
+
+  ```clojure
+  (require '[chengis.tools :as tools]
+           '[chengis.tools.temurin :as temurin]
+           '[chengis.tools.maven   :as maven]
+           '[chengis.tools.gradle  :as gradle]
+           '[chengis.tools.node    :as node])
+  (tools/register-installer! (temurin/temurin-installer))
+  (tools/register-installer! (maven/maven-installer))
+  (tools/register-installer! (gradle/gradle-installer))
+  (tools/register-installer! (node/node-installer))
+  ```
+
+  The order is resolution priority. With multiple installers handling
+  the same descriptor, the first registered wins.
+
 ## [0.2.1] — 2026-06-05
 
 **Theme:** the file-ownership fix. 0.2.0 made Docker execution work; 0.2.1
