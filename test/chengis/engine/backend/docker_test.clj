@@ -247,3 +247,92 @@
          (finally
            (backend/cleanup b {:job-name "rl" :build-number 1})
            (.delete (io/file ws))))))))
+
+;; ---------------------------------------------------------------------------
+;; CC2-EX1c — --user $(id -u):$(id -g) so container writes land on host as
+;; the calling user, not root. Without this, mvn-package-inside-container
+;; writes target/*.jar as root:root on the host, and anvil (running as the
+;; calling user) can't read or copy them for archiveArtifacts.
+;; ---------------------------------------------------------------------------
+
+(deftest user-flags-explicit-string-takes-precedence
+  (testing "explicit :user 'X' overrides :host-user? default detection"
+    (is (= ["--user" "1234:5678"]
+           (#'docker/user-flags {:user "1234:5678"})))
+    (is (= ["--user" "root"]
+           (#'docker/user-flags {:user "root" :host-user? true})))))
+
+(deftest user-flags-host-user-false-emits-nothing
+  (testing ":host-user? false → no --user flag (container runs as image default)"
+    (is (= [] (#'docker/user-flags {:host-user? false})))
+    (is (= [] (#'docker/user-flags {:host-user? false :user nil})))))
+
+(deftest user-flags-default-detects-host-uid-gid
+  (testing "no explicit config → default :host-user? true → tries to detect uid:gid"
+    (let [r (#'docker/user-flags {})]
+      ;; On linux + most macOS hosts, `id -u` and `id -g` work and return digits.
+      ;; On sandboxed environments without `id`, the helper returns nil and
+      ;; user-flags returns [].
+      (is (or (= r [])
+              (and (= "--user" (first r))
+                   (re-matches #"\d+:\d+" (second r))))
+          (str "expected either [] (no `id` on host) or [\"--user\" \"N:M\"], got "
+               (pr-str r))))))
+
+(deftest ^:docker user-flag-actually-changes-file-ownership-inside-container
+  ;; Uses docker-or-skip (the file-wide pattern) instead of bare
+  ;; (when docker-available?) per PR #9 Copilot review. Skip is logged
+  ;; cleanly so CI without docker doesn't silently pass.
+  (docker-or-skip
+   (fn []
+     (testing "with --user $(uid):$(gid), files written by container are owned by host user"
+       ;; The workspace bind-mounts at the same absolute path inside the
+       ;; container (no /workspace prefix), so the file is at <ws>/marker
+       ;; on host and at <ws>/marker inside the container.
+       (let [ws (tmp-workspace)
+             ;; Backend A: :host-user? true (default) — auto-detect host uid:gid
+             b-host (docker/docker-backend
+                      {:image "alpine:3.20" :mode :per-step :host-user? true})
+             r-host (backend/prepare-workspace b-host
+                       {:workspace-path ws :job-name "u-host" :build-number 1})
+             exec-host (backend/execute-step
+                         b-host {:command "touch host-marker && stat -c %u:%g host-marker"
+                                 :dir ws
+                                 :env {}
+                                 :backend-state (:backend-state r-host)})
+             host-stdout (str/trim (or (:stdout exec-host) ""))
+             host-uid-gid (when-let [[u g] @@#'docker/host-uid-gid]
+                            (str u ":" g))
+
+             ;; Backend B: :host-user? false — container runs as image default (root)
+             b-root (docker/docker-backend
+                      {:image "alpine:3.20" :mode :per-step :host-user? false})
+             r-root (backend/prepare-workspace b-root
+                       {:workspace-path ws :job-name "u-root" :build-number 1})
+             exec-root (backend/execute-step
+                         b-root {:command "touch root-marker && stat -c %u:%g root-marker"
+                                 :dir ws
+                                 :env {}
+                                 :backend-state (:backend-state r-root)})
+             root-stdout (str/trim (or (:stdout exec-root) ""))]
+         (try
+           (is (= :ok (:result r-host)))
+           (is (= :ok (:result r-root)))
+
+           ;; With :host-user? true, file inside container is owned by host uid:gid
+           (when host-uid-gid
+             (is (= host-uid-gid host-stdout)
+                 (str "host-marker should be owned by host's uid:gid "
+                      host-uid-gid ", got " host-stdout)))
+
+           ;; With :host-user? false, file is owned by 0:0 (alpine's root)
+           (is (= "0:0" root-stdout)
+               (str "root-marker should be owned by 0:0 (container's root), got "
+                    root-stdout))
+
+           (finally
+             (backend/cleanup b-host {:job-name "u-host" :build-number 1})
+             (backend/cleanup b-root {:job-name "u-root" :build-number 1})
+             (.delete (io/file ws "host-marker"))
+             (.delete (io/file ws "root-marker"))
+             (.delete (io/file ws)))))))))
