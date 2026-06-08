@@ -18,6 +18,7 @@
    which tests didn't run."
   (:require [chengis.engine.backend :as backend]
             [chengis.engine.backend.k8s :as k8s]
+            [clojure.data.json]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
@@ -184,11 +185,23 @@
                               {:command "echo hi"}
                               "p-1" {})
         labels (-> m :metadata :labels)]
-    ;; These labels are what cancel's `kubectl delete pod -l ...`
-    ;; selector matches against. Don't break the contract silently.
-    (is (= "chengis-step" (:app labels)))
-    (is (= "myjob" (:chengis.io/job-name labels)))
-    (is (= "7" (:chengis.io/build-number labels)))))
+    ;; STRING keys — `clojure.data.json` drops the namespace of
+    ;; namespaced keyword keys at serialize time, which would
+    ;; silently break `cancel`'s selector. We lock the serialized
+    ;; shape in the IR so the assertion catches any regression
+    ;; back to keyword keys. PR #14 Copilot review.
+    (is (= "chengis-step" (get labels "app")))
+    (is (= "myjob" (get labels "chengis.io/job-name")))
+    (is (= "7" (get labels "chengis.io/build-number")))
+    (testing "labels survive a json round-trip with the namespace intact"
+      ;; This is the contract that the bug being fixed broke. Lock it.
+      (let [round-trip (-> m
+                           clojure.data.json/write-str
+                           (clojure.data.json/read-str)
+                           (get "metadata")
+                           (get "labels"))]
+        (is (= "myjob" (get round-trip "chengis.io/job-name"))
+            "namespaced label key must survive JSON serialization")))))
 
 ;; ---------------------------------------------------------------------------
 ;; Pod name sanitization

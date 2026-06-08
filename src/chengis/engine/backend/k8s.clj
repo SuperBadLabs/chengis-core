@@ -63,15 +63,38 @@
 
    `:namespace` config selects the k8s namespace. Defaults to
    `default`. The backend does NOT create the namespace — operators
-   are responsible for provisioning it. Pod names are deterministically
-   derived from (job-name, build-number) so cancellation can target
-   by name.
+   are responsible for provisioning it. Pod names are derived from
+   (job-name, build-number, per-step salt) so retries within a build
+   don't collide; cancellation can't target by name alone, so every
+   pod is also stamped with `chengis.io/job-name` +
+   `chengis.io/build-number` labels and `cancel` deletes by selector.
+
+   ## Workspace semantics (first-cut)
+
+   Every step pod mounts a fresh `emptyDir` at `/home/jenkins/agent`.
+   The `:workspace-path` passed to `prepare-workspace` is NOT
+   bind-mounted into the pod — that path is on the controller host,
+   not on the cluster node. Consequence: cross-step state inside the
+   pod's workspace dir does NOT persist across steps, and host-side
+   built-in steps that read the workspace path (e.g. anvil's
+   archiveArtifacts / junit) see an empty dir.
+
+   This is intentional for the v0.6 T1 first-cut — host-bind-mount
+   doesn't generalize to remote clusters and PVC plumbing was scoped
+   out. Pipelines that depend on cross-step workspace state need
+   either docker-backend (which bind-mounts) or a follow-up T1.x
+   that adds PVC support.
 
    ## Cancellation
 
-   `cancel` issues `kubectl delete pod --grace-period=N <name>`. k8s
-   sends SIGTERM, waits the grace period, then SIGKILL. The default
-   grace is 10s — same as the docker backend's `:cancel-grace-ms`.
+   `cancel` issues `kubectl delete pod -l <selector>
+   --grace-period=N --ignore-not-found=true`, where the selector
+   matches every pod stamped with the build's `chengis.io/job-name` +
+   `chengis.io/build-number` labels. k8s sends SIGTERM, waits the
+   grace period, then SIGKILL. The default grace is 10s — same as
+   the docker backend's `:cancel-grace-ms`. Sweep-by-selector (not
+   delete-by-name) is necessary because per-step pods are
+   individually salted, so there's no single tracked name to target.
 
    ## What this is NOT
 
@@ -307,9 +330,15 @@
      :kind "Pod"
      :metadata {:name pod
                 :namespace namespace
-                :labels {:app "chengis-step"
-                         :chengis.io/job-name (or (some-> (:job-name config) str) "")
-                         :chengis.io/build-number (or (some-> (:build-number config) str) "")}}
+                ;; STRING keys for labels — `clojure.data.json` drops the
+                ;; namespace of namespaced keyword keys at serialize time
+                ;; (`:chengis.io/job-name` would emit as `"job-name"`),
+                ;; silently breaking `cancel`'s `-l chengis.io/job-name=…`
+                ;; selector. Lock the serialized form here so the contract
+                ;; is wire-stable. PR #14 Copilot review.
+                :labels {"app" "chengis-step"
+                         "chengis.io/job-name" (or (some-> (:job-name config) str) "")
+                         "chengis.io/build-number" (or (some-> (:build-number config) str) "")}}
      :spec spec}))
 
 ;; ---------------------------------------------------------------------------
