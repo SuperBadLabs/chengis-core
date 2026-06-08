@@ -6,6 +6,45 @@ versioning follows [Semantic Versioning](https://semver.org/) but with
 the pre-1.0 disclaimer: **API may break across minor releases until
 `1.0.0`**.
 
+## [0.4.1] — 2026-06-08
+
+**Theme:** PR #14 review follow-up. Patch release covering bugs +
+docs caught by Copilot review on the 0.4.0 ship.
+
+### Fixed
+
+- **Pod label keys are strings, not namespaced keywords** (#15).
+  `clojure.data.json/write-str` silently drops the namespace of
+  namespaced keyword map keys at serialize time, so
+  `:chengis.io/job-name` was reaching the apiserver as
+  `"job-name"`. Result: `cancel`'s
+  `kubectl delete pod -l chengis.io/job-name=…` selector matched
+  zero pods. With string keys the serialized form is wire-stable;
+  the cancel selector now actually targets the build's pods. Test
+  extended with a JSON round-trip assertion to lock the contract.
+
+### Changed (docs only)
+
+- Namespace + Cancellation docstrings now match the actual
+  implementation: pod names include a per-step salt; `cancel`
+  deletes by label selector (not by name). The pre-fix wording
+  implied delete-by-name, misleading operators reading the source.
+- New "Workspace semantics (first-cut)" section documenting that
+  `:workspace-path` is host-side and NOT bind-mounted into the pod
+  (every step pod gets a fresh emptyDir). Locks the v0.6 T1
+  scope-cut into the doc.
+
+### Compatibility notes
+
+- Wire-incompatible label-key change in the pod manifest. Operators
+  who built dashboards/alerts on `metadata.labels` should expect
+  string keys (`"chengis.io/job-name"`) rather than the (broken)
+  namespaceless `"job-name"` shape that 0.4.0 emitted. Anything
+  that used the cancel selector to match pods was no-op on 0.4.0,
+  so this is a fix, not a break.
+
+[0.4.1]: https://github.com/SuperBadLabs/chengis-core/releases/tag/v0.4.1
+
 ## [0.4.0] — 2026-06-08
 
 **Theme:** the Kubernetes backend. 0.3 closed the tool-installer matrix;
