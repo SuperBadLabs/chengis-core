@@ -6,6 +6,75 @@ versioning follows [Semantic Versioning](https://semver.org/) but with
 the pre-1.0 disclaimer: **API may break across minor releases until
 `1.0.0`**.
 
+## [0.4.0] — 2026-06-08
+
+**Theme:** the Kubernetes backend. 0.3 closed the tool-installer matrix;
+0.4 closes the third execution backend (after LocalShell + Docker) so
+consuming products (anvil) can honor `agent { kubernetes { ... } }`
+without bundling a k8s SDK.
+
+One new namespace, ~430 LOC, zero new transitive deps on the
+classpath. CLI shell-out to `kubectl` mirrors the docker-backend's
+shape — same operator-habit story.
+
+### Added
+
+- **`chengis.engine.backend.k8s`** — Kubernetes execution backend
+  implementing `chengis.engine.backend/ExecutionBackend`. Per-step
+  mode (analog to docker-backend's `:per-step`): each step gets a
+  fresh pod with `restartPolicy: Never`, runs `sh -c '<command>'`,
+  emits exit code + logs, then `kubectl delete pod`. Honors:
+    - `:resource-limits` → pod container resources (`:memory-mb` →
+      `<N>Mi`; `:cpus` → `<N>` cpu). `:cpu-shares` and `:pids-max`
+      are dropped honestly (no k8s analog).
+    - `:env` → pod container env list, stable-ordered.
+    - `:user STRING` (numeric uid) → `securityContext.runAsUser`.
+      Non-numeric values dropped with a warning (k8s wants a uid).
+    - `:host-user?` (default true) → auto-detects host uid via
+      `id -u` and stamps `runAsUser`, matching docker-backend
+      behaviour so workspace files are host-readable.
+    - Kubeconfig lookup: explicit `:kubeconfig-path` → `KUBECONFIG`
+      env → `~/.kube/config`. Threaded into every kubectl invocation
+      via `KUBECONFIG=` so the backend doesn't mutate the calling
+      process env.
+    - Pod labels (`chengis.io/job-name`, `chengis.io/build-number`)
+      stamp every pod so `cancel` can target by label selector and
+      sweep all pods belonging to a build (per-step mode pods are
+      individually salted; the label is the only stable handle).
+  Cancel issues `kubectl delete pod -l ...` with a configurable
+  `:cancel-grace-ms` (default 10000ms — matches docker-backend).
+  (#NN anvil v0.6 T1.1)
+- New `:k8s` test selector — `lein test :k8s` runs the cluster-required
+  acceptance tests against the kubeconfig-default cluster. Tests
+  self-skip with a single info log when no cluster is reachable, so
+  default `lein test` runs continue to be hermetic.
+
+### Verified against
+
+- Anvil's `agent { kubernetes { yaml '...' } }` translator (anvil
+  v0.6 T1.3 / T1.4) routes through this backend. After 0.4.0 lands,
+  operators with a kind cluster + `:k8s-agent` flag on observe a
+  pod scheduled per step in the configured namespace.
+- 19 always-on tests + 3 cluster-required tests. Full chengis-core
+  suite remains green.
+
+### Compatibility notes
+
+- Consumers depending only on `chengis.engine.*` (LocalShell + Docker)
+  are unaffected — this release only adds a new public namespace
+  under `chengis.engine.backend.k8s`.
+- No deprecation. The Docker + LocalShell backends keep the exact
+  shape they had in 0.3.x.
+
+### Locked decisions referenced
+
+- AV6-2 (anvil v0.6 board): K8s backend lives in chengis-core, NOT
+  in anvil. anvil only consumes the protocol.
+- CC2-EX6 (chengis-core extraction board): the protocol's third
+  reference impl after LocalShell and Docker.
+
+[0.4.0]: https://github.com/SuperBadLabs/chengis-core/releases/tag/v0.4.0
+
 ## [0.3.0] — 2026-06-06
 
 **Theme:** the tool-installer matrix. 0.2.x shipped the execution layer +
