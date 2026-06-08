@@ -6,6 +6,83 @@ versioning follows [Semantic Versioning](https://semver.org/) but with
 the pre-1.0 disclaimer: **API may break across minor releases until
 `1.0.0`**.
 
+## [0.4.2] — 2026-06-08
+
+**Theme:** silent-failure follow-up. Three bugs in the K8s backend +
+log-masker, all bugs of omission rather than commission — code worked
+in the happy path and silently misbehaved in edge cases. Caught by
+post-0.4.1 code review.
+
+### Fixed
+
+- **`wait-for-pod-phase` cancel race.** `wait-for-pod-phase` only
+  terminated on `Succeeded`/`Failed` or timeout. When `cancel` deleted
+  the pod mid-build, kubectl started returning NotFound, phase became
+  the empty string, and the loop polled until the full 300s timeout —
+  the executor sat for 5 minutes after every cancel before being
+  unblocked. Now: a non-zero kubectl exit whose stderr contains
+  `NotFound` short-circuits to a new `:deleted` result; the caller in
+  `run-disposable-pod` skips the redundant `delete-pod!` (the pod is
+  already gone) and returns `{:exit-code 137 :cancelled? true ...}`.
+  Cancel acknowledges in <500ms instead of waiting out the timeout.
+
+- **Label values reach the apiserver unsanitized.** Pod label values
+  were the raw `job-name` / `build-number` strings. k8s label values
+  must match `[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?` and be ≤63
+  chars; anvil job-names containing `/` (`"org/repo"`), `:`
+  (`"branch:tag"`), or >63 chars failed `kubectl apply` opaquely.
+  Worse: `cancel` built a label selector from the unsanitized
+  `job-name` too, so a value like `"foo,bar"` formed a 2-clause
+  selector at the kubectl level — wide pod-delete blast radius across
+  unrelated builds. New `sanitize-label-value` is applied in
+  `build-pod-spec` AND `cancel` so the selector matches exactly what
+  was stamped.
+
+- **`mask-secrets` order-dependent partial-leak.** The reduce over
+  `secret-values` ran in iteration order. With input
+  `["abc" "abcdef"]` on the text `"abcdef token"`, replacing `"abc"`
+  first turned the text into `"***def token"` — the longer secret
+  `"abcdef"` never matched again and leaked as `"***def"`. Now
+  secrets are sorted by length descending before the reduce so longer
+  values always mask first.
+
+- **Divergent mask copy in `streaming-process`.** A second inline
+  reduce in `streaming-process/read-stream` carried subtly different
+  rules (`"****"` four stars vs `mask-secrets`'s `"***"` three;
+  `str/blank?` vs the inner `(seq ...)` guard) and would have had the
+  same partial-leak bug if reached on a long secret. Replaced with a
+  direct call to `masker/mask-secrets` so there's one masking
+  implementation, one set of invariants.
+
+### Added
+
+- `chengis.engine.log-masker/min-secret-length` — minimum length
+  (4) below which `mask-secrets` refuses to mask, emitting a one-line
+  warn. Operator footgun protection: stamping `"a"` or `"ok"` as a
+  secret turns build output into a `***` soup; secrets that small are
+  worthless from a security standpoint anyway.
+
+- `chengis.engine.backend.k8s/sanitize-label-value` — pure utility
+  exposed so cancel-by-label callers (and tests) can reproduce the
+  exact sanitized form used at apply time.
+
+### Compatibility notes
+
+- Label values for `chengis.io/job-name` and
+  `chengis.io/build-number` are now sanitized. Dashboards/alerts
+  that filtered on the raw (rejected-by-apiserver) shape will need
+  to switch to the sanitized form. Anything that successfully
+  matched on 0.4.1 will continue to match on 0.4.2 — sanitization
+  is a no-op on already-valid label values.
+
+- `execute-step` may now return `:cancelled? true` on the result map
+  when the pod was deleted out from under us. Existing consumers
+  that only read `:exit-code` / `:stdout` / `:stderr` are unaffected;
+  consumers that want to distinguish cancel from process exit-137
+  can opt in to the new key.
+
+[0.4.2]: https://github.com/SuperBadLabs/chengis-core/releases/tag/v0.4.2
+
 ## [0.4.1] — 2026-06-08
 
 **Theme:** PR #14 review follow-up. Patch release covering bugs +
