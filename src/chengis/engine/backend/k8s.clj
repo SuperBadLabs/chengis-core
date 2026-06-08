@@ -254,6 +254,35 @@
   (mapv (fn [[k v]] {:name (str k) :value (str v)})
         (sort-by key (or env {}))))
 
+(defn sanitize-label-value
+  "Sanitize a string into a valid k8s label-value.
+
+   k8s label values must match `[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?`
+   and be ≤63 chars (apiserver hard limit; longer values are rejected).
+   Any character outside `[A-Za-z0-9_.-]` becomes `-`, the result is
+   trimmed to 63 chars, and leading/trailing non-alphanumeric chars are
+   stripped.
+
+   The historical bug this guards (0.4.1 and earlier): raw `job-name`
+   values reached labels unsanitized. Anvil job names like `org/repo`
+   or `feature/branch:tag` contain `/` and `:`, which the apiserver
+   rejects at `kubectl apply` time with an opaque error; even worse,
+   values containing `,` would form a multi-clause label selector in
+   `cancel` and delete unrelated pods. Always sanitize before stamping
+   AND before building selectors.
+
+   Returns the sanitized string, or an empty string if input is nil/blank."
+  [s]
+  (if (str/blank? (str s))
+    ""
+    (let [cleaned (-> (str s)
+                      (str/replace #"[^A-Za-z0-9_.-]" "-")
+                      (str/replace #"-+" "-"))
+          trimmed (if (> (count cleaned) 63)
+                    (subs cleaned 0 63)
+                    cleaned)]
+      (str/replace trimmed #"^[^A-Za-z0-9]+|[^A-Za-z0-9]+$" ""))))
+
 (defn pod-name
   "Deterministic per-build/step pod name. k8s names: lowercased,
    [a-z0-9-], ≤253 chars (we target ≤63 to be safe for service-DNS
@@ -336,9 +365,17 @@
                 ;; silently breaking `cancel`'s `-l chengis.io/job-name=…`
                 ;; selector. Lock the serialized form here so the contract
                 ;; is wire-stable. PR #14 Copilot review.
+                ;;
+                ;; Values are sanitized via `sanitize-label-value` because
+                ;; k8s rejects label values that don't match
+                ;; `[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?` (≤63 chars).
+                ;; Anvil job-names with `/` (org/repo) or `:` (branch:tag)
+                ;; or >63 chars would otherwise fail `kubectl apply`
+                ;; opaquely. Cancel reads back the sanitized form, see
+                ;; `sanitize-label-value` for the bug context.
                 :labels {"app" "chengis-step"
-                         "chengis.io/job-name" (or (some-> (:job-name config) str) "")
-                         "chengis.io/build-number" (or (some-> (:build-number config) str) "")}}
+                         "chengis.io/job-name" (sanitize-label-value (:job-name config))
+                         "chengis.io/build-number" (sanitize-label-value (or (:build-number config) ""))}}
      :spec spec}))
 
 ;; ---------------------------------------------------------------------------
@@ -361,7 +398,16 @@
 (defn- wait-for-pod-phase
   "Poll `kubectl get pod -o jsonpath='{.status.phase}'` until phase is
    Succeeded or Failed, or until timeout elapses. Returns the final
-   phase string (or :timed-out)."
+   phase string, `:timed-out`, or `:deleted`.
+
+   `:deleted` is returned when kubectl reports the pod no longer exists
+   (non-zero exit + stderr contains `NotFound`). This is the
+   cancel-acknowledged path: when an external actor (the executor's
+   `cancel` method) deletes the pod mid-build, the apiserver starts
+   returning NotFound and the phase string blanks out. Without this
+   exit, the loop would poll until the full timeout (300s default),
+   silently wasting 5 minutes of executor thread on every cancel —
+   the cancel doesn't actually unblock the build thread. Bug 0.4.2#1."
   [kubeconfig namespace pod-name- timeout-ms]
   (let [deadline (+ (System/currentTimeMillis) (or timeout-ms 300000))]
     (loop []
@@ -370,11 +416,17 @@
                             "-n" namespace
                             "-o" "jsonpath={.status.phase}"]
                            {:timeout 5000})
-            phase (str/trim (or (:out r) ""))]
+            phase (str/trim (or (:out r) ""))
+            err (str (:err r))
+            not-found? (and (not (zero? (:exit r)))
+                            (str/includes? err "NotFound"))]
         (cond
           (and (zero? (:exit r))
                (contains? #{"Succeeded" "Failed"} phase))
           phase
+
+          not-found?
+          :deleted
 
           (>= (System/currentTimeMillis) deadline)
           :timed-out
@@ -455,20 +507,33 @@
        :timed-out? false}
       (let [phase (wait-for-pod-phase kubeconfig namespace name (or timeout 300000))
             timed-out? (= phase :timed-out)
-            logs (pod-logs kubeconfig namespace name)
-            exit-code (or (pod-exit-code kubeconfig namespace name)
-                          (case phase
-                            "Succeeded" 0
-                            "Failed" 1
-                            (if timed-out? 124 -1)))
-            _ (delete-pod! kubeconfig namespace name
-                           (get config :cancel-grace-ms 10000))
+            deleted? (= phase :deleted)
+            ;; If the pod was deleted out from under us (cancel), kubectl
+            ;; logs / get-status will also fail — short-circuit straight
+            ;; to a cancel-acknowledged result with exit 137 (SIGKILL,
+            ;; the conventional "killed by k8s" code). No delete-pod!
+            ;; call: the pod is already gone, and re-issuing delete
+            ;; against the empty namespace bucket just burns 15s.
+            logs (if deleted? {:out ""} (pod-logs kubeconfig namespace name))
+            exit-code (cond
+                        deleted? 137
+                        :else (or (pod-exit-code kubeconfig namespace name)
+                                  (case phase
+                                    "Succeeded" 0
+                                    "Failed" 1
+                                    (if timed-out? 124 -1))))
+            _ (when-not deleted?
+                (delete-pod! kubeconfig namespace name
+                             (get config :cancel-grace-ms 10000)))
             end (System/currentTimeMillis)
-            base {:exit-code exit-code
-                  :stdout (:out logs)
-                  :stderr ""
-                  :duration-ms (- end start)
-                  :timed-out? (boolean timed-out?)}]
+            base (cond-> {:exit-code exit-code
+                          :stdout (:out logs)
+                          :stderr (if deleted?
+                                    "pod deleted during execution (cancel)"
+                                    "")
+                          :duration-ms (- end start)
+                          :timed-out? (boolean timed-out?)}
+                   deleted? (assoc :cancelled? true))]
         (cond-> base
           (seq mask-values) (-> (update :stdout masker/mask-secrets mask-values)
                                 (update :stderr masker/mask-secrets mask-values)))))))
@@ -537,9 +602,18 @@
     ;; there's no single tracked name to delete. Best-effort: delete
     ;; ALL pods labeled with this job+build. The label selector matches
     ;; what build-pod-spec stamps on metadata.labels.
+    ;;
+    ;; CRITICAL: sanitize BOTH the value we stamp AND the value we
+    ;; select on. A raw job-name like `"foo,bar"` would otherwise turn
+    ;; the selector into `chengis.io/job-name=foo,bar,…` — k8s parses
+    ;; that as a 2-clause selector (`job-name=foo` AND `bar=…`),
+    ;; potentially deleting unrelated pods. Bug 0.4.2#2: the
+    ;; sanitized form must match exactly what build-pod-spec emits.
     (let [namespace (or (:namespace config) "default")
-          selector (str "chengis.io/job-name=" (str job-name)
-                        ",chengis.io/build-number=" (str (or build-number 0)))
+          job-label (sanitize-label-value job-name)
+          build-label (sanitize-label-value (or build-number 0))
+          selector (str "chengis.io/job-name=" job-label
+                        ",chengis.io/build-number=" build-label)
           grace (get config :cancel-grace-ms 10000)
           grace-s (max 0 (long (/ grace 1000)))]
       (try

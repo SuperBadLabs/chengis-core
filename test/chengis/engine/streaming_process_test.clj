@@ -76,6 +76,11 @@
 
 (deftest mask-values-test
   (testing "sensitive values are masked in output"
+    ;; Convergence with chengis.engine.log-masker (0.4.2#3 fix):
+    ;; streaming-process now delegates to log-masker rather than
+    ;; carrying its own inline reduce, so the replacement is `***`
+    ;; (three stars, the log-masker constant) — not `****` as the
+    ;; pre-fix divergent copy emitted. Locking the convergent shape.
     (let [lines (atom [])
           result (sp/execute-command-streaming
                   {:command "echo 'secret-password-123'"
@@ -84,7 +89,25 @@
                    :on-line (fn [_source _line-num text]
                               (swap! lines conj text))})]
       (is (= 0 (:exit-code result)))
-      (is (= "****" (first @lines))))))
+      (is (= "***" (first @lines))
+          "streaming masker must produce the same `***` as log-masker (convergence)"))))
+
+(deftest mask-values-convergence-with-log-masker-test
+  ;; Direct regression for bug 0.4.2#3 divergent-copy half: the
+  ;; streaming masker used to carry its own inline reduce with subtly
+  ;; different rules. We now delegate to log-masker; verify the
+  ;; output shape matches what log-masker would have produced on the
+  ;; same input.
+  (testing "streaming masker output matches log-masker output line-for-line"
+    (let [secrets ["abc" "abcdef"]
+          lines (atom [])
+          _ (sp/execute-command-streaming
+             {:command "printf 'abcdef token\\nplain line\\n'"
+              :mask-values secrets
+              :chunk-size 100
+              :on-line (fn [_s _n text] (swap! lines conj text))})]
+      (is (= ["*** token" "plain line"] @lines)
+          "longer secret masks first (log-masker invariant) and short rules carry through"))))
 
 (deftest empty-output-test
   (testing "command with no output"

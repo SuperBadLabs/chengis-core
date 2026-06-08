@@ -2,8 +2,8 @@
   "Line-by-line process output capture with chunking.
    Provides execute-command-streaming as an alternative to
    process/execute-command for incremental log streaming."
-  (:require [clojure.java.io :as io]
-            [clojure.string :as str]
+  (:require [chengis.engine.log-masker :as masker]
+            [clojure.java.io :as io]
             [taoensso.timbre :as log])
   (:import [java.io BufferedReader InputStreamReader]
            [java.util.concurrent TimeUnit]))
@@ -20,11 +20,12 @@
     (try
       (loop []
         (when-let [line (.readLine reader)]
-          (let [masked-line (reduce (fn [l v]
-                                      (if (and v (not (str/blank? v)))
-                                        (str/replace l v "****")
-                                        l))
-                                    line (or mask-values []))]
+          ;; Delegate masking to log-masker so the streaming path and the
+          ;; whole-string path apply the same secret-ordering + min-length
+          ;; rules. The previous divergent inline reduce used `****` (four
+          ;; stars) where log-masker uses `***`, and didn't sort by length —
+          ;; same partial-leak bug as bug #3. Keep them convergent.
+          (let [masked-line (masker/mask-secrets line mask-values)]
             ;; Call on-line callback
             (when on-line
               (on-line source @line-count masked-line))

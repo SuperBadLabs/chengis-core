@@ -204,6 +204,117 @@
             "namespaced label key must survive JSON serialization")))))
 
 ;; ---------------------------------------------------------------------------
+;; Label value sanitization (0.4.2#2 regression)
+;; ---------------------------------------------------------------------------
+
+(deftest sanitize-label-value-strips-disallowed-chars
+  ;; k8s label values must match [A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?
+  ;; Slash, colon, comma are the common offenders in anvil job-names.
+  (is (= "foo-bar"     (k8s/sanitize-label-value "foo/bar")))
+  (is (= "foo-bar-tag" (k8s/sanitize-label-value "foo/bar:tag")))
+  (is (= "foo-bar"     (k8s/sanitize-label-value "foo,bar"))
+      "comma in job-name must collapse — otherwise it splits the cancel selector"))
+
+(deftest sanitize-label-value-truncates-to-63
+  (let [long-name (apply str (repeat 80 "x"))
+        out (k8s/sanitize-label-value long-name)]
+    (is (<= (count out) 63))
+    (is (every? #(Character/isLetterOrDigit ^char %) [(first out) (last out)])
+        "first + last char must be alphanumeric after truncation")))
+
+(deftest sanitize-label-value-blank-input
+  (is (= "" (k8s/sanitize-label-value nil)))
+  (is (= "" (k8s/sanitize-label-value "")))
+  (is (= "" (k8s/sanitize-label-value "   "))))
+
+(deftest pod-spec-label-values-sanitized
+  ;; Bug 0.4.2#2: raw job-name reached labels unsanitized. k8s would
+  ;; reject `kubectl apply` with an opaque error on names like
+  ;; "org/repo" or "feature/branch:tag".
+  (let [m (k8s/build-pod-spec {:image "busybox:1.36"
+                               :host-user? false
+                               :job-name "org/repo"
+                               :build-number 7}
+                              {:command "echo hi"}
+                              "p-1" {})
+        labels (-> m :metadata :labels)
+        job-label (get labels "chengis.io/job-name")]
+    (is (= "org-repo" job-label)
+        "slash in job-name must be sanitized to a dash before reaching the label")
+    (is (re-matches #"[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?" job-label)
+        "label value must match k8s label-value regex")))
+
+(deftest cancel-selector-is-single-clause-on-comma-job-name
+  ;; Bug 0.4.2#2: cancel built its label selector from the raw
+  ;; `job-name`. A value like "foo,bar" would form a 2-clause
+  ;; selector (`job-name=foo,bar=…`) — wide pod-delete blast radius.
+  ;; We can't run kubectl, but we can mock `run-kubectl` and capture
+  ;; the args, asserting the selector contains exactly one comma
+  ;; (separating the two label clauses).
+  (let [captured-args (atom nil)
+        b (k8s/k8s-backend {:image "busybox:1.36"})]
+    (with-redefs [k8s/run-kubectl (fn [_kc args & _opts]
+                                    (reset! captured-args args)
+                                    {:exit 0 :out "" :err ""})]
+      (backend/cancel b {:job-name "foo,bar" :build-number 7}))
+    (is (some? @captured-args) "cancel must invoke run-kubectl")
+    (let [selector (->> @captured-args
+                        (drop-while #(not= "-l" %))
+                        second)]
+      (is (string? selector))
+      ;; Exactly 1 comma — the one between the two label clauses.
+      ;; A 2-clause-from-job-name bug would yield 2+ commas.
+      (is (= 1 (count (filter #{\,} selector)))
+          (str "selector must have exactly one comma (the inter-clause separator); "
+               "got `" selector "`. A second comma indicates the raw job-name's "
+               "comma broke the selector into extra clauses."))
+      (is (str/includes? selector "chengis.io/job-name=foo-bar")
+          "sanitized job-name must appear in the selector"))))
+
+;; ---------------------------------------------------------------------------
+;; wait-for-pod-phase cancel race (0.4.2#1 regression)
+;; ---------------------------------------------------------------------------
+
+(deftest wait-for-pod-phase-returns-deleted-on-notfound
+  ;; Bug 0.4.2#1: when an external cancel deleted the pod mid-build,
+  ;; kubectl started returning NotFound; the loop polled until the
+  ;; full 300s timeout because nothing distinguished
+  ;; "deleted out from under us" from "still pending".
+  ;; Mock run-kubectl to return the NotFound shape and assert the
+  ;; loop returns :deleted promptly.
+  (let [wait-fn @#'k8s/wait-for-pod-phase
+        call-count (atom 0)
+        start (System/currentTimeMillis)]
+    (with-redefs [k8s/run-kubectl (fn [_kc _args & _opts]
+                                    (swap! call-count inc)
+                                    {:exit 1
+                                     :out ""
+                                     :err "Error from server (NotFound): pods \"x\" not found"})]
+      ;; Use a generous timeout (5s) — if the fix works, we return
+      ;; in <500ms; if it regresses, this would hang for 5s before
+      ;; failing on the assertion.
+      (let [phase (wait-fn "/dev/null/kubeconfig" "default" "pod-x" 5000)
+            elapsed (- (System/currentTimeMillis) start)]
+        (is (= :deleted phase)
+            "NotFound from kubectl must short-circuit to :deleted, not poll to timeout")
+        (is (< elapsed 2000)
+            (str "must return promptly (got " elapsed "ms); regression to the "
+                 "pre-fix timeout-only behavior."))
+        (is (= 1 @call-count)
+            "should only need one kubectl call to detect NotFound")))))
+
+(deftest wait-for-pod-phase-still-honors-terminal-phases
+  ;; Sanity: the new :deleted branch must not break the Succeeded/Failed
+  ;; happy path.
+  (let [wait-fn @#'k8s/wait-for-pod-phase]
+    (with-redefs [k8s/run-kubectl (fn [_kc _args & _opts]
+                                    {:exit 0 :out "Succeeded" :err ""})]
+      (is (= "Succeeded" (wait-fn "/x" "default" "pod-x" 5000))))
+    (with-redefs [k8s/run-kubectl (fn [_kc _args & _opts]
+                                    {:exit 0 :out "Failed" :err ""})]
+      (is (= "Failed" (wait-fn "/x" "default" "pod-x" 5000))))))
+
+;; ---------------------------------------------------------------------------
 ;; Pod name sanitization
 ;; ---------------------------------------------------------------------------
 
