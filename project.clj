@@ -1,4 +1,4 @@
-(defproject superbadlabs/chengis-core "0.3.0"
+(defproject superbadlabs/chengis-core "0.4.0"
   :description
   "chengis-core — the composable Clojure CI/CD engine library underlying
    anvil (OSS, single-tenant) and Chengis (commercial, multi-tenant).
@@ -77,9 +77,13 @@
   ;; against a real docker daemon. They self-skip (emit a single log line)
   ;; when no daemon is reachable, so they're included in :default; the
   ;; :docker selector exists for the operator-targeted form `lein test :docker`.
+  ;; ^:k8s tests exercise the chengis.engine.backend.k8s backend against
+  ;; a real cluster (kubectl + reachable apiserver). Same self-skip pattern
+  ;; as ^:docker; the :k8s selector targets `lein test :k8s`.
   :test-selectors {:default (complement :product-integration)
                    :product-integration :product-integration
                    :docker :docker
+                   :k8s :k8s
                    :all (constantly true)}
 
   ;; Strict warnings — core is small and must stay clean.
